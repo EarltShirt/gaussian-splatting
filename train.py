@@ -107,7 +107,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                print("Saving {} Gaussians".format(scene.gaussians.get_xyz.shape[0]))
                 scene.save(iteration)
+
+            if (iteration % 1000 == 0):
+                print("\n[ITER {}] Number of Gaussians: {}".format(iteration, scene.gaussians.get_xyz.shape[0]))
 
             # Densification
             if iteration < opt.densify_until_iter:
