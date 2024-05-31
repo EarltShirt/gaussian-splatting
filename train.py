@@ -28,6 +28,263 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+from IPython.display import display, HTML
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import sys
+from PIL import Image, ImageDraw
+
+from segment_anything import sam_model_registry, SamPredictor
+
+def show_points(coords, labels, ax, marker_size=375):
+    pos_points = coords[labels==1]
+    neg_points = coords[labels==0]
+    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+
+def show_mask(mask, random_color=False):
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        color = np.array([30/255, 144/255, 255/255, 0.6])
+    h, w = mask.shape[-2:]
+    mask_image = np.zeros((h, w, 4), dtype=np.uint8)
+    mask_image[:, :, :3] = (mask.reshape(h, w, 1) * color[:3] * 255).astype(np.uint8)
+    mask_image[:, :, 3] = (mask.reshape(h, w) * color[3] * 255).astype(np.uint8)
+    return Image.fromarray(mask_image, 'RGBA')
+
+def show_box(box, ax):
+    x0, y0 = box[0], box[1]
+    w, h = box[2] - box[0], box[3] - box[1]
+    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2))    
+
+
+class InteractiveSegmenter:
+
+    def __init__(self, image, predictor):
+        self.image = image
+        self.predictor = predictor
+        self.input_points = []
+        self.input_labels = []
+        self.input_box = []
+        self.colors = [np.random.random(4) for _ in range(10)]
+        self.num_green_points = 1
+        self.num_red_points = 0
+        self.num_boxes = 0
+        self.fig = None
+        self.ax = None
+        self.cid = None
+
+    def ask_for_number_of_points(self):
+        print("How many green points would you like to add?")
+        self.num_green_points = int(input())
+        print("How many red points would you like to add?")
+        self.num_red_points = int(input())
+        # print("How many boxes would you like to add? (0 or 1 box)")
+        # self.num_boxes = int(input())
+        # assert self.num_boxes in [0, 1], "Only 0 or 1 box is supported for now."
+
+    def retrieve_all(self):
+        self.fig, self.ax = plt.subplots(figsize=(10, 10))
+        self.ax.imshow(self.image)
+        self.cid = self.fig.canvas.mpl_connect('button_press_event', self.onclick)
+
+        plt.axis('on')
+        plt.show()
+
+
+    def onclick(self, event):
+        ix, iy = event.xdata, event.ydata
+        if ix is not None and iy is not None:
+            if len(self.input_points) < self.num_green_points:
+                self.input_points.append([ix, iy])
+                self.input_labels.append(1)  # Assigning label 1 for green points
+            elif len(self.input_points) < self.num_green_points + self.num_red_points:
+                self.input_points.append([ix, iy])
+                self.input_labels.append(0)  # Assigning label 0 for red points
+            elif len(self.input_box) < 4:
+                self.input_box += [ix, iy]
+                self.ax.scatter(ix, iy, marker='o', s=375, color='blue', linewidth=1.25) 
+                # print("Box :", self.input_box)
+            self.ax.clear()  # Clear the current plot
+            self.ax.imshow(self.image)  # Replot the image
+            show_points(np.array(self.input_points), np.array(self.input_labels), self.ax)  # Plot all points
+
+            if len(self.input_box) == 4:
+                show_box(self.input_box, self.ax)
+            plt.draw()
+            
+            if (len(self.input_points) == self.num_green_points + self.num_red_points) and (len(self.input_box) == 4 * self.num_boxes):
+                self.fig.canvas.mpl_disconnect(self.cid)
+                self.compute_masks()
+        plt.draw()  # Update the plot
+
+    def compute_masks(self):
+        input_points_array = np.array(self.input_points)
+        input_labels_array = np.array(self.input_labels)
+        input_box_array = np.array(self.input_box)
+        print("Box : ", input_box_array)
+        
+        if len(input_box_array) != 0:
+            masks, scores, logits = self.predictor.predict(
+                point_coords=input_points_array,
+                point_labels=input_labels_array,
+                box=input_box_array[None, :],
+                multimask_output=True,
+            )
+        else:
+            masks, scores, logits = self.predictor.predict(
+                point_coords=input_points_array,
+                point_labels=input_labels_array,
+                multimask_output=True,
+            )
+        
+        num_masks = len(masks)
+        rows = 1
+        cols = num_masks
+
+        fig, axes = plt.subplots(rows, cols, figsize=(15, 7))
+
+        for i, (mask, score) in enumerate(zip(masks, scores)):
+            color = self.colors[i % len(self.colors)]
+            mask_rgba = show_mask(mask, random_color=True)
+            # self.gaussians.add_2Dmask(mask_rgba, i)
+            
+            ax = axes[i] if num_masks > 1 else axes
+            ax.imshow(self.image)
+            ax.imshow(mask_rgba)
+            ax.set_title(f"Mask {i + 1} (score: {score:.2f})")
+            show_points(input_points_array, input_labels_array, ax)
+            ax.axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+def segment_anything(image): # image is given in float32, which isn't supported by PIL
+    print("Reading image...")
+    image = np.transpose(image, (1, 2, 0))
+    print(f"Value example in image : {image[500,500,:]}")
+    image = (image * 255).astype(np.uint8)
+    # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    print("Loading model...")
+    sam_checkpoint = "./sam_vit_h_4b8939.pth"
+    model_type = "vit_h"
+    device = "cuda"
+    print("Loading model on device...")
+    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    sam.to(device=device)
+    predictor = SamPredictor(sam)
+    predictor.set_image(image)
+    # interactive_segmenter = InteractiveSegmenter(image, predictor, gaussians)
+    interactive_segmenter = InteractiveSegmenter(image, predictor)
+    interactive_segmenter.ask_for_number_of_points()
+    interactive_segmenter.retrieve_all()
+
+# def __init__(self, image, predictor, gaussians):
+#     self.image = image
+#     self.predictor = predictor
+#     self.input_points = []
+#     self.input_labels = []
+#     self.input_box = []
+#     self.colors = [np.random.random(4) for _ in range(10)]
+#     self.num_green_points = 1
+#     self.num_red_points = 0
+#     self.num_boxes = 0
+#     self.fig = None
+#     self.ax = None
+#     self.cid = None
+#     self.gaussians = gaussians
+
+# def segment_anything(gaussians, image, part, view): # image is given in float32, which isn't supported by PIL
+#     print("Reading image...")
+#     image = np.transpose(image, (1, 2, 0))
+#     print(f"Value example in image : {image[500,500,:]}")
+#     image = (image * 255).astype(np.uint8)
+#     # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+#     print("Loading model...")
+#     sam_checkpoint = "./sam_vit_h_4b8939.pth"
+#     model_type = "vit_h"
+#     device = "cuda"
+#     print("Loading model on device...")
+#     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+#     sam.to(device=device)
+#     predictor = SamPredictor(sam)
+#     predictor.set_image(image)
+#     interactive_segmenter = InteractiveSegmenter(image, predictor, gaussians)
+#     interactive_segmenter.ask_for_number_of_points()
+#     interactive_segmenter.retrieve_all(part, view)
+
+# def retrieve_all(self, part, view):
+#     self.fig, self.ax = plt.subplots(figsize=(10, 10))
+#     self.ax.imshow(self.image)
+#     self.cid = self.fig.canvas.mpl_connect('button_press_event', self.onclick(part, view))
+#     plt.axis('on')
+#     plt.show()
+
+# def onclick(self, event, part, view):
+#     ix, iy = event.xdata, event.ydata
+#     if ix is not None and iy is not None:
+#         if len(self.input_points) < self.num_green_points:
+#             self.input_points.append([ix, iy])
+#             self.input_labels.append(1)  # Assigning label 1 for green points
+#         elif len(self.input_points) < self.num_green_points + self.num_red_points:
+#             self.input_points.append([ix, iy])
+#             self.input_labels.append(0)  # Assigning label 0 for red points
+#         elif len(self.input_box) < 4:
+#             self.input_box += [ix, iy]
+#             self.ax.scatter(ix, iy, marker='o', s=375, color='blue', linewidth=1.25) 
+#             # print("Box :", self.input_box)
+#         self.ax.clear()  # Clear the current plot
+#         self.ax.imshow(self.image)  # Replot the image
+#         show_points(np.array(self.input_points), np.array(self.input_labels), self.ax)  # Plot all points
+#         if len(self.input_box) == 4:
+#             show_box(self.input_box, self.ax)
+#         plt.draw()
+#         if (len(self.input_points) == self.num_green_points + self.num_red_points) and (len(self.input_box) == 4 * self.num_boxes):
+#             self.fig.canvas.mpl_disconnect(self.cid)
+#             self.compute_masks(part, view)
+#     plt.draw()  # Update the plot
+
+# def compute_masks(self, part, view):
+#     input_points_array = np.array(self.input_points)
+#     input_labels_array = np.array(self.input_labels)
+#     input_box_array = np.array(self.input_box)
+#     print("Box : ", input_box_array)
+#     if len(input_box_array) != 0:
+#         masks, scores, logits = self.predictor.predict(
+#             point_coords=input_points_array,
+#             point_labels=input_labels_array,
+#             box=input_box_array[None, :],
+#             multimask_output=True,
+#         )
+#     else:
+#         masks, scores, logits = self.predictor.predict(
+#             point_coords=input_points_array,
+#             point_labels=input_labels_array,
+#             multimask_output=True,
+#         )
+#     num_masks = len(masks)
+#     rows = 1
+#     cols = num_masks
+#     fig, axes = plt.subplots(rows, cols, figsize=(15, 7))
+#     for i, (mask, score) in enumerate(zip(masks, scores)):
+#         color = self.colors[i % len(self.colors)]
+#         mask_rgba = show_mask(mask, random_color=True)
+#         self.gaussians.add_2Dmask(mask_rgba, part, view)
+#         ax = axes[i] if num_masks > 1 else axes
+#         ax.imshow(self.image)
+#         ax.imshow(mask_rgba)
+#         ax.set_title(f"Mask {i + 1} (score: {score:.2f})")
+#         show_points(input_points_array, input_labels_array, ax)
+#         ax.axis('off')
+#     plt.tight_layout()
+#     plt.show()
+#################################################################################################
+#################################################################################################
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -94,6 +351,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_end.record()
 
+        #################################################################################################
+        ############################################ SEGMENTATION #######################################
+        if iteration == 10000 :
+            # Convert image to numpy array
+            # print(f"dir(image) : {dir(image)}")
+            seg_viewpoint_stack = scene.getTrainCameras().copy()
+            seg_viewpoint_cam = seg_viewpoint_stack.pop(20)
+            seg_render_pkg = render(seg_viewpoint_cam, gaussians, pipe, bg)
+            seg_image = seg_render_pkg["render"]
+            seg_image = seg_image.detach().cpu().numpy()
+            segment_anything(seg_image)
+
+        # if iteration == 20000 :
+        #     seg_viewpoint_stack = scene.getTrainCameras().copy()
+        #     for part in range(4) : # there are 4 main parts to be segmented on the UR
+        #         for view in range(len(seg_viewpoint_stack)) :
+        #             seg_viewpoint_stack = scene.getTrainCameras().copy()
+        #             seg_viewpoint_cam = seg_viewpoint_stack.pop(view)
+        #             seg_render_pkg = render(seg_viewpoint_cam, gaussians, pipe, bg)
+        #             seg_image = seg_render_pkg["render"]
+        #             seg_image = seg_image.detach().cpu().numpy()
+        #             segment_anything(gaussians, seg_image, part, view)
+        #################################################################################################
+        #################################################################################################   
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log

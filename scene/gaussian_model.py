@@ -21,6 +21,12 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+from PIL import Image, ImageDraw
+#################################################################################################
+#################################################################################################
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -57,6 +63,15 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+        #################################################################################################
+        #################################### ADDITIONAL PARAMETERS ######################################
+        self._mask2D_idx = torch.empty(0) #(#gaussians, #views) : group index of each gaussian for each view
+        self._mask2D = torch.empty(0) #(#groups, #views, height, width) : list of binary 2D masks (used for the loss)
+        self._mask3D_idx = torch.empty(0) #(#gaussians) : group index of each gaussian
+        self._mask3D = torch.empty(0) #(#groups, height, width, depth) : list of binary 3D masks (used for grouping, moving, etc.)
+        #################################################################################################
+        #################################################################################################
 
     def capture(self):
         return (
@@ -114,6 +129,23 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+
+    #################################################################################################
+    ##################################### ADDITIONAL METHODS ########################################
+    # def add_2Dmask(self, mask_rgba, part, view):
+    #     # mask_rgba : Image (PIL)
+    #     # view : int
+    #     # part : int
+    #     mask = torch.tensor(np.array(mask_rgba)[:,:,3])
+    #     mask = mask.unsqueeze(0).unsqueeze(0)
+    #     mask = mask.bool()
+    #     # add the mask to the 2D mask list only at place [part, view]
+    #     self._mask2D[part, view] = mask
+    #################################################################################################
+    #################################################################################################    
+
+
+
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
@@ -145,6 +177,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+        print(f"Features_dc shape : {self._features_dc.shape}")
+        print(f"Features_rest shape : {self._features_rest.shape}")
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense

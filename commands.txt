@@ -1,0 +1,3 @@
+python train.py -s C:\Users\AD278604\Documents\data\synthetic_UR_processed\different_radii\factory
+
+./SIBR_viewers/bin/SIBR_remoteGaussian_app.exe --port 6009 --path "C:\Users/AD278604/Documents/data/synthetic_UR_processed/different_radii/SyntheticUR_multicam_3DGS_white"
