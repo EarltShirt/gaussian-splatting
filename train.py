@@ -28,9 +28,33 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+import json
+
+
+def load_bounds(file_path):
+    # load the bounds dictionary from the json file
+    with open(file_path, 'r') as file:
+        bounds = json.load(file)
+    return bounds
+
+
+#################################################################################################
+#################################################################################################
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, bounds_file):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+    # Bbox_lst = load_bounds(bounds_file)
+
+
+#################################################################################################
+#################################################################################################
+
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -209,6 +233,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--json_bounds", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -220,7 +245,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.json_bounds)
 
     # All done
     print("\nTraining complete.")

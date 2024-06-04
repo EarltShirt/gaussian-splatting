@@ -58,6 +58,11 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+        # list containing the group index for each gaussian (gaussians 
+        #are supposed to stay in the same order in the _xyz tensor)
+        self.groups_3D = torch.empty(0)
+
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -113,6 +118,22 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
+    
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+    def set_groups(self, np_groups):
+        self.groups_3D = torch.tensor(np.asarray(np_groups)).float().cuda()
+
+    def set_group(self, gaussian_idx, group_idx):
+        self.groups_3D[gaussian_idx] = group_idx
+
+    def set_group(self, gaussian_idx_start, gaussian_idx_end, group_idx):
+        self.groups_3D[gaussian_idx_start:gaussian_idx_end] = group_idx
+
+    def get_group(self, gaussian_idx):
+        return self.groups_3D[gaussian_idx]
+#################################################################################################
+#################################################################################################
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)

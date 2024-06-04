@@ -108,8 +108,14 @@ def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    try:
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    except:
+        colors = np.zeros_like(positions)
+    try:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    except:
+        normals = np.zeros_like(positions)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -218,7 +224,143 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+
+def load_bounds(file_path):
+    # load the bounds dictionary from the json file
+    print(f'file_path : {file_path}')
+    with open(file_path, 'r') as file:
+        bounds = json.load(file)
+    return bounds
+
+def segment_from_ply(bounds, num_pts, path, gaussians):
+    ply_path = os.path.join(path, "points3d.ply") 
+    part1 = []
+    part2 = []
+    part3 = []
+    part4 = []
+    for key in bounds.keys():
+        if 'part1' in key:
+            part1.append(key)
+        elif 'part2' in key:
+            part2.append(key)
+        elif 'part3' in key:
+            part3.append(key)
+        elif 'part4' in key:
+            part4.append(key)
+    parts = []
+    parts.append(part1)
+    parts.append(part2)
+    parts.append(part3)
+    parts.append(part4)
+
+    print(f'Parts : {parts}')
+
+    epsilon = np.ones(3) * 10e-3
+
+    # print(f'Bounds for part3_angle_l : {bounds["part3_angle_l"]}')
+
+    # This has to be done when generating the files using blender (fbx and ply files).
+    # Note that during the generation of the ply file, coordinates are flipped and the scale has to be brought up to x100
+    for bound in bounds.values():
+        tmp_min_x = bound["min"][0]
+        tmp_min_z = bound["min"][2]
+        bound["min"][0] = -1 * bound["max"][0]
+        bound["min"][2] = -1 * bound["max"][2]
+        bound["max"][0] = -1 * tmp_min_x
+        bound["max"][2] = -1 * tmp_min_z
+        bound["min"] = np.array(bound["min"]) - epsilon
+        bound["max"] = np.array(bound["max"]) + epsilon
+
+    # print(f'Bounds for part3_angle_l : {bounds["part3_angle_l"]}')
+
+    pcd = fetchPly(ply_path)
+    points = pcd.points
+    # check if the point cloud is correctly segmented by coloring each segmented part of the UR
+    colors = pcd.colors
+    normals = pcd.normals
+
+    group_id = 0
+    group_lst = np.zeros(num_pts)
+
+    # list of 11 distinct colors
+    colors_lst = np.array([[255, 0, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255]])
+    colors_lst = colors_lst / 255.0
+    for part in parts:
+        group_id += 1
+        for subpart in part:
+            min, max = np.array(bounds[subpart]["min"]), np.array(bounds[subpart]["max"])
+            print(f'Group {group_id} - Part : {subpart} - Min : {min} - Max : {max}')
+            i = 0
+            j = 0
+            for point in points:
+                if np.all(point >= min) and np.all(point <= max):
+                    group_lst[i] = group_id
+                    colors[i] = colors_lst[group_id-1]
+                    j += 1
+                i += 1
+            print(f'Number of points in subpart {subpart} : {j}')
+
+    new_pcd = BasicPointCloud(points=points, colors=colors, normals=normals)
+    new_ply_path = os.path.join(path, "points3d_segmented.ply")
+
+
+    storePly(new_ply_path, new_pcd.points, SH2RGB(new_pcd.colors)*255)
+    print(f'Storing segmented point cloud at {new_ply_path}')
+    gaussians.set_groups(group_lst)
+    
+def generate_pcd(bounds, num_pts, path, gaussians):
+    part1 = []
+    part2 = []
+    part3 = []
+    part4 = []
+    num_pts_per_part = int(num_pts / len(bounds.keys())) # this is an int since there are 10 keys for the moment
+    for key in bounds.keys():
+        if 'part1' in key:
+            part1.append(key)
+        elif 'part2' in key:
+            part2.append(key)
+        elif 'part3' in key:
+            part3.append(key)
+        elif 'part4' in key:
+            part4.append(key)
+    parts = []
+    parts.append(part1)
+    parts.append(part2)
+    parts.append(part3)
+    parts.append(part4)
+    xyz = np.empty(shape=(num_pts,3))
+    # xyz = []
+    i = 0
+    group_id = 0
+    group_lst = np.zeros(num_pts)
+    for part in parts:
+        group_id += 1
+        for subpart in part:
+            min, max = np.array(bounds[subpart]["min"]), np.array(bounds[subpart]["max"])
+            xyz_tmp = np.random.uniform(low = min, high = max, size = (num_pts_per_part,3))
+            xyz[num_pts_per_part*i:num_pts_per_part*(i+1), :] = xyz_tmp
+            group_lst[num_pts_per_part*i:num_pts_per_part*(i+1)] = group_id
+            # xyz.append(xyz_tmp)
+            i+=1
+    # xyz = np.array(xyz) # .reshape((num_pts,3))
+    shs = np.random.random((num_pts, 3)) / 255.0
+    pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+    print(f'xyz shape : {np.shape(xyz)}')
+
+    ply_path = os.path.join(path, "points3d.ply")
+    storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+    print(f'group list : {group_lst[::1000]}')
+
+    gaussians.set_groups(group_lst)
+#################################################################################################
+#################################################################################################
+
+
+def readNerfSyntheticInfo(path, white_background, eval, gaussians, extension=".png"):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
@@ -237,15 +379,38 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
         num_pts = 300_000
         print(f"Generating random point cloud ({num_pts})...")
 
-        # Bounding_cube_size = 2.6
-        Bounding_cube_size = 20.0
-        
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * Bounding_cube_size - (Bounding_cube_size / 2.0)
-        shs = np.random.random((num_pts, 3)) / 255.0
-        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+        bounds_path = os.path.join(path, "bounding_boxes.json")
+        bounds = load_bounds(bounds_path)
 
-        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+        generate_pcd(bounds, num_pts, path, gaussians)
+
+#################################################################################################
+#################################################################################################
+
+        # # Bounding_cube_size = 2.6
+        # Bounding_cube_size = 20.0
+        
+        # # We create random points inside the bounds of the synthetic Blender scenes
+        # xyz = np.random.random((num_pts, 3)) * Bounding_cube_size - (Bounding_cube_size / 2.0)
+        # shs = np.random.random((num_pts, 3)) / 255.0
+        # pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        # storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+    if os.path.exists(ply_path):
+        print(f'Point cloud found at {ply_path}')
+        bounds_path = os.path.join(path, "bounding_boxes.json")
+        bounds = load_bounds(bounds_path)
+        num_points = len(fetchPly(ply_path).points)
+        print(f'num_points : {num_points}')
+        segment_from_ply(bounds, num_points, path, gaussians)
+
+#################################################################################################
+#################################################################################################
     try:
         pcd = fetchPly(ply_path)
     except:
