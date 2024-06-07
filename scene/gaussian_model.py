@@ -132,6 +132,20 @@ class GaussianModel:
 
     def get_group(self, gaussian_idx):
         return self.groups_3D[gaussian_idx]
+    
+    def rotate_group(self, group_idx : int, rotation : torch.Tensor, pivot_point : torch.Tensor):
+        '''
+        Rotate all gaussians in the group group_idx by the rotation 
+        matrix rotation around the pivot point pivot_point
+        
+        Args:
+            rotation : torch.Tensor of shape (3, 3)
+            pivot_point : torch.Tensor of shape (3,)
+        Returns:
+            None, the gaussians are rotated in place
+        '''
+        group_mask = self.groups_3D == group_idx
+        self._xyz[group_mask] = torch.bmm(rotation, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1) + pivot_point
 #################################################################################################
 #################################################################################################
     
