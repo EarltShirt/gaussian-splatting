@@ -81,6 +81,7 @@ class GaussianModel:
         self._groups = torch.empty(0)
         self.bounds = None
         self.parts = None
+        self.pivots = None
 
 
     def capture(self):
@@ -162,15 +163,37 @@ class GaussianModel:
     def set_parts(self, parts):
         self.parts = parts
 
+    def get_pivots(self):
+        return self.pivots
+    
+    def get_pivot(self, part_idx):
+        switcher = {
+            1: 'part_1',
+            2: 'part_2',
+            3: 'part_3',
+            4: 'part_4'
+        }
+        print(f"Calling get_pivot with part_idx : {part_idx}")
+        return self.pivots[switcher.get(part_idx, "Invalid part index")]
+
     def define_pivots(self):
         pivots = {}
         for group_idx, bound in self.bounds.items():
-            pivots[group_idx] = (np.array(bound["min"]) + np.array(bound["max"])) / 2
+            if 'part1_angle_l' in group_idx:
+                pivots['part_1'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            elif 'part2_angle_l' in group_idx:
+                pivots['part_2'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            elif 'part3_angle_l' in group_idx:
+                pivots['part_3'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            elif 'part4_angle_l' in group_idx:
+                pivots['part_4'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+        self.pivots = pivots
 
-    def rotate_group(self, group_idx : int, rotation : torch.Tensor, pivot_point : torch.Tensor):
+    def rotate_group(self, group_idx : int, rotation : torch.Tensor):
         '''
         Rotate all gaussians in the group group_idx by the rotation 
         matrix rotation around the pivot point pivot_point
+        Every Gaussian of the higher level groups have also to be rotated
         
         Args:
             rotation : torch.Tensor of shape (3, 3)
@@ -178,8 +201,27 @@ class GaussianModel:
         Returns:
             None, the gaussians are rotated in place
         '''
-        group_mask = self._groups == group_idx
+        pivot_point = self.get_pivot(group_idx)
+        group_mask = self._groups >= group_idx
         self._xyz[group_mask] = torch.bmm(rotation, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1) + pivot_point
+
+    def rotate_groups_test(self, group_idx : int, rotation : torch.Tensor):
+        '''
+        Same as before, but not in place in order to test the function
+        
+        Args:
+            rotation : torch.Tensor of shape (3, 3)
+            pivot_point : torch.Tensor of shape (3,)
+        Returns:
+            New xyz tensor
+        '''
+        pivot_point = torch.tensor(self.get_pivot(group_idx)).cpu().float()
+        xyz = self._xyz.clone().cpu().float()
+        group_mask = (self._groups >= group_idx).cpu()
+        N = xyz[group_mask].shape[0]
+        rotations = rotation.repeat(N, 1, 1).float()
+        xyz[group_mask] = torch.add(torch.bmm(rotations, (xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1).cpu().numpy(), pivot_point.repeat(N, 1).cpu().numpy())
+        return xyz, group_mask
 
     def prune_points_groups(self, mask):
         valid_points_mask = ~mask
@@ -328,8 +370,6 @@ class GaussianModel:
         groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
         # self._groups = torch.zeros((self._xyz.shape[0]), device="cuda")
         xyz = self._xyz.detach().cpu().numpy()
-        print(f'Shape of xyz : {xyz.shape}')
-
 
         for group_idx, bound in self.bounds.items():
             if 'part1' in group_idx:
@@ -416,9 +456,7 @@ class GaussianModel:
 
         bounds = self.bounds
         parts = self.parts
-
-        print(f'bounds : {bounds}')
-        
+        print(f'Parts : {parts}')
 
         colors_lst = np.array([[255, 0, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255]])
         seg_colors = np.zeros((seg_xyz.shape[0], 3))
@@ -438,16 +476,15 @@ class GaussianModel:
 
         storePly(path, seg_xyz, seg_colors)
         
-        # create one ply per bound using the min and max to generate the 8 points of the bounding box
-        # bound_color = np.array([255, 255, 255])
+        bound_color = np.array([255, 255, 255])
 
-        # for key, bound in bounds.items():
-        #     min = bound["min"]
-        #     max = bound["max"]
-        #     bound_xyz = np.array([[min[0], min[1], min[2]], [max[0], min[1], min[2]], [max[0], max[1], min[2]], [min[0], max[1], min[2]], [min[0], min[1], max[2]], [max[0], min[1], max[2]], [max[0], max[1], max[2]], [min[0], max[1], max[2]]])
-        #     bound_colors = np.full((bound_xyz.shape[0], 3), bound_color)
-        #     bound_path = path.replace(".ply", f"_{key}.ply")
-        #     storePly(bound_path, bound_xyz, bound_colors)
+        for key, bound in bounds.items():
+            min = bound["min"]
+            max = bound["max"]
+            bound_xyz = np.array([[min[0], min[1], min[2]], [max[0], min[1], min[2]], [max[0], max[1], min[2]], [min[0], max[1], min[2]], [min[0], min[1], max[2]], [max[0], min[1], max[2]], [max[0], max[1], max[2]], [min[0], max[1], max[2]]])
+            bound_colors = np.full((bound_xyz.shape[0], 3), bound_color)
+            bound_path = path.replace(".ply", f"_{key}.ply")
+            storePly(bound_path, bound_xyz, bound_colors)
     
     def save_segmented_ply(self, path):
         xyz = self._xyz.detach().cpu().numpy()
@@ -484,6 +521,13 @@ class GaussianModel:
         # el = PlyElement.describe(elements, 'vertex')
 
         # PlyData([el]).write(path)
+
+    def store_rotated_groups(self, path : str, group_idx : int, rotation : torch.Tensor):
+        self.define_pivots()
+        rotated_xyz, rotated_mask = self.rotate_groups_test(group_idx, rotation)
+        colors = np.zeros((rotated_xyz.shape[0], 3))
+        colors[rotated_mask] = np.array([128, 0, 128])
+        storePly(path, rotated_xyz.detach().cpu().numpy(), colors)
 #################################################################################################
 #################################################################################################
     

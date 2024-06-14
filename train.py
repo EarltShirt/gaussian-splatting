@@ -154,11 +154,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     #################################################################################################
     ####################################### MY ADDITIONS ############################################
             # Every 500 iterations, we regroup the gaussians using the boudning boxes
-            if iteration % 500 == 0 and iteration < 7000:
+            if iteration % 500 == 0 and iteration > 1000 and iteration < 7000:
                 print("\n[ITER {}] Regrouping Gaussians".format(iteration))
                 scene.gaussians.regroup_and_prune()
             
-            if iteration == 1000:
+            if iteration == 500:
                 gaussians.regroup_and_prune()
                 print("\n[ITER {}] Group Visualization".format(iteration))
                 segmented_ply_path = os.path.join(scene.model_path, "segmented.ply")    
@@ -167,6 +167,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 post_segmented_ply_path = os.path.join(scene.model_path, "post_segmented.ply")
                 print("\nStoring the pre-segmetned point cloud at {}".format(segmented_ply_path))
                 print("\nStoring the post-segmented point cloud at {}".format(post_segmented_ply_path))
+                rotation_tensor = torch.tensor([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=torch.float32, device="cpu")
+                rotated_ply_path = os.path.join(scene.model_path, "rotated.ply")
+                gaussians.store_rotated_groups(rotated_ply_path, 3, rotation_tensor)
+                print("\nStoring the rotated point cloud at {}".format(rotated_ply_path))
                 gaussians.save_post_segmented_ply(post_segmented_ply_path)
     #################################################################################################
     #################################################################################################
