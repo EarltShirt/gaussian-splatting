@@ -216,11 +216,11 @@ class GaussianModel:
             New xyz tensor
         '''
         pivot_point = torch.tensor(self.get_pivot(group_idx)).cpu().float()
-        xyz = self._xyz.clone().cpu().float()
+        xyz = self._xyz.clone().cpu().numpy().float()
         group_mask = (self._groups >= group_idx).cpu()
         N = xyz[group_mask].shape[0]
         rotations = rotation.repeat(N, 1, 1).float()
-        xyz[group_mask] = torch.add(torch.bmm(rotations, (xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1).cpu().numpy(), pivot_point.repeat(N, 1).cpu().numpy())
+        xyz[group_mask] = np.add(torch.bmm(rotations, (xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1).cpu().numpy(), pivot_point.repeat(N, 1).cpu().numpy())
         return xyz, group_mask
 
     def prune_points_groups(self, mask):
