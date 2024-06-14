@@ -21,6 +21,24 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+# I need this function in order to store the post-segmented point cloud
+def storePly(path, xyz, rgb):
+    # Define the dtype for the structured array
+    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+    
+    normals = np.zeros_like(xyz)
+
+    elements = np.empty(xyz.shape[0], dtype=dtype)
+    attributes = np.concatenate((xyz, normals, rgb), axis=1)
+    elements[:] = list(map(tuple, attributes))
+
+    # Create the PlyData object and write to file
+    vertex_element = PlyElement.describe(elements, 'vertex')
+    ply_data = PlyData([vertex_element])
+    ply_data.write(path)
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -60,7 +78,9 @@ class GaussianModel:
 
         # list containing the group index for each gaussian (gaussians 
         #are supposed to stay in the same order in the _xyz tensor)
-        self.groups_3D = torch.empty(0)
+        self._groups = torch.empty(0)
+        self.bounds = None
+        self.parts = None
 
 
     def capture(self):
@@ -122,17 +142,31 @@ class GaussianModel:
 #################################################################################################
 ####################################### MY ADDITIONS ############################################
     def set_groups(self, np_groups):
-        self.groups_3D = torch.tensor(np.asarray(np_groups)).float().cuda()
+        self._groups = torch.tensor(np.asarray(np_groups)).float().cuda()
 
     def set_group(self, gaussian_idx, group_idx):
-        self.groups_3D[gaussian_idx] = group_idx
+        self._groups[gaussian_idx] = group_idx
 
     def set_group(self, gaussian_idx_start, gaussian_idx_end, group_idx):
-        self.groups_3D[gaussian_idx_start:gaussian_idx_end] = group_idx
+        self._groups[gaussian_idx_start:gaussian_idx_end] = group_idx
 
     def get_group(self, gaussian_idx):
-        return self.groups_3D[gaussian_idx]
+        return self._groups[gaussian_idx]
     
+    def get_groups(self):
+        return self._groups
+
+    def set_bounds(self, bounds):
+        self.bounds = bounds
+
+    def set_parts(self, parts):
+        self.parts = parts
+
+    def define_pivots(self):
+        pivots = {}
+        for group_idx, bound in self.bounds.items():
+            pivots[group_idx] = (np.array(bound["min"]) + np.array(bound["max"])) / 2
+
     def rotate_group(self, group_idx : int, rotation : torch.Tensor, pivot_point : torch.Tensor):
         '''
         Rotate all gaussians in the group group_idx by the rotation 
@@ -144,8 +178,312 @@ class GaussianModel:
         Returns:
             None, the gaussians are rotated in place
         '''
-        group_mask = self.groups_3D == group_idx
+        group_mask = self._groups == group_idx
         self._xyz[group_mask] = torch.bmm(rotation, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1) + pivot_point
+
+    def prune_points_groups(self, mask):
+        valid_points_mask = ~mask
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+
+        self.denom = self.denom[valid_points_mask]
+        self.max_radii2D = self.max_radii2D[valid_points_mask]
+
+        self._groups = self._prune_optimizer_groups(valid_points_mask)
+
+    def _prune_optimizer_groups(self, mask):
+        groups_tensor = self._groups[mask]
+        return groups_tensor
+
+    def cat_tensors_to_optimizer_groups(self, tensors_dict):
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            assert len(group["params"]) == 1
+            extension_tensor = tensors_dict[group["name"]]
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+            if stored_state is not None:
+
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
+
+                del self.optimizer.state[group['params'][0]]
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                self.optimizer.state[group['params'][0]] = stored_state
+
+                optimizable_tensors[group["name"]] = group["params"][0]
+            else:
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                optimizable_tensors[group["name"]] = group["params"][0]
+
+        return optimizable_tensors
+    
+
+    def densification_postfix_groups(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_groups):
+        d = {"xyz": new_xyz,
+        "f_dc": new_features_dc,
+        "f_rest": new_features_rest,
+        "opacity": new_opacities,
+        "scaling" : new_scaling,
+        "rotation" : new_rotation}
+
+        optimizable_tensors = self.cat_tensors_to_optimizer_groups(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # only concatenation when cloning, use of prune_points_groups after the splitting
+        self._groups = torch.cat((self._groups, new_groups))
+
+    def densify_and_split_groups(self, grads, grad_threshold, scene_extent, N=2):
+        n_init_points = self.get_xyz.shape[0]
+        # Extract points that satisfy the gradient condition
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        # standard deviation for the new gaussians
+        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        # means for the new gaussians
+        means =torch.zeros((stds.size(0), 3),device="cuda")
+        # generate N samples for each new gaussian
+        samples = torch.normal(mean=means, std=stds)
+        # Build the rotations
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        # apply the rotations to the new gaussians an translate them to the original position
+        # this isn't a concatenation, it's a element-wise sum
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        # adjust the scaling for the new gaussians
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        # replicate the other attributes of the splitted gaussians
+        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+
+        new_groups = self._groups[selected_pts_mask].repeat(N, 1).flatten()
+
+        # concatenate the new gaussians to the existing ones
+        self.densification_postfix_groups(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_groups)
+        # create mask to prune original points that were split
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        # prune the points
+        self.prune_points_groups(prune_filter)
+
+    def densify_and_clone_groups(self, grads, grad_threshold, scene_extent):
+        # Extract points that satisfy the gradient condition
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+
+        new_groups = self._groups[selected_pts_mask]
+
+        self.densification_postfix_groups(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_groups)
+
+    def densify_and_prune_groups(self, max_grad, min_opacity, extent, max_screen_size):
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+
+        self.densify_and_clone_groups(grads, max_grad, extent)
+        self.densify_and_split_groups(grads, max_grad, extent)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points_groups(prune_mask)
+
+        torch.cuda.empty_cache()
+
+    def Regroup_Gaussians(self):
+        '''
+        Reassings the groups to the gaussians based on their position using the
+        associated bounds (group_idxc in [1, #groups], -1 for environment, 0 for no group)
+        '''
+
+        epsilon = np.ones(3) * 0.001
+        groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
+        # self._groups = torch.zeros((self._xyz.shape[0]), device="cuda")
+        xyz = self._xyz.detach().cpu().numpy()
+        print(f'Shape of xyz : {xyz.shape}')
+
+
+        for group_idx, bound in self.bounds.items():
+            if 'part1' in group_idx:
+                idx = 1
+            elif 'part2' in group_idx:
+                idx = 2
+            elif 'part3' in group_idx:
+                idx = 3
+            elif 'part4' in group_idx:
+                idx = 4
+            else :
+                idx = 0
+            # group mask using numpy
+            # if idx ==1 :
+            #     print(f'\nxyz[100:110] :\n {xyz[2000:2020]} \n and the mininum bound :\n {np.array(bound["min"]) - epsilon}')
+            #     print(f'Testing the np.all method : {np.all(xyz[100:110] >= np.array(bound["min"]) - epsilon, axis=1)}')
+            # if idx == 4:
+            #     print(f'\nxyz[100:110] :\n {xyz[2000:2020]} \n and the mininum bound :\n {np.array(bound["min"]) - epsilon}')
+            #     print(f'Testing the np.all method : {np.all(xyz[100:110] >= np.array(bound["min"]) - epsilon, axis=1)}')
+            # group_mask = np.all(xyz >= np.array(bound["min"]) - epsilon, axis=1) & np.all(xyz <= np.array(bound["max"]) + epsilon, axis=1)
+            # print(f'Group {idx} - Part : {group_idx} - Min : {bound["min"]} - Max : {bound["max"]} : {np.sum(group_mask)} points')
+            # self._groups[group_mask] = idx
+            group_mask = torch.where(
+                torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"])).to(device="cuda"), dim=1), True, False
+            )
+            group_mask = torch.logical_and(group_mask, torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"])).to(device="cuda"), dim=1))
+            groups[group_mask] = idx
+
+        self._groups = groups
+
+    def regroup_gaussians(self):
+        '''
+        Reassings the groups to the gaussians based on their position using the
+        associated bounds (group_idxc in [1, #groups], -1 for environment, 0 for no group)
+        '''
+
+        # groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
+
+        epsilon = np.ones(3) * 0.001
+        self._groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
+
+        for group_idx, bound in self.bounds.items():
+            if 'part1' in group_idx:
+                idx = 1
+            elif 'part2' in group_idx:
+                idx = 2
+            elif 'part3' in group_idx:
+                idx = 3
+            elif 'part4' in group_idx:
+                idx = 4
+            else :
+                idx = 0
+            
+            # group_mask = torch.where(
+            #     torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"])).to(device="cuda"), dim=1), True, False
+            # )
+            # group_mask = torch.logical_and(group_mask, torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"])).to(device="cuda"), dim=1))
+            # groups[group_mask] = idx
+            group_mask = torch.logical_and(torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"]) - epsilon).to(device="cuda"), dim=1), torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"]) + epsilon).to(device="cuda"), dim=1))
+            self._groups[group_mask] = idx
+            print(f'Group {idx} - Part : {group_idx} - Min : {bound["min"]} - Max : {bound["max"]} : {torch.sum(group_mask)} points')
+        
+    def regroup_and_prune(self):
+        '''
+        Removes the points that are not assigned to any group
+        '''
+        n_gaussians = self.get_xyz.shape[0]
+        # self.regroup_gaussians()
+        self.Regroup_Gaussians()
+        group_mask = self._groups == 0
+        # valid_points_mask = ~group_mask
+        # print(f"The minimum group index before pruning is {torch.min(self._groups)}")
+
+        self.prune_points_groups(group_mask)
+
+        # print(f"The minimum group index after pruning is {torch.min(self._groups)}")
+        print(f'Pruned {n_gaussians - self.get_xyz.shape[0]} points')
+
+    def save_post_segmented_ply(self, path):
+        seg_xyz = self._xyz.detach().cpu().numpy()
+        # seg_normals = np.zeros_like(seg_xyz)
+
+        # groups = self._groups.detach().cpu().numpy()
+
+        bounds = self.bounds
+        parts = self.parts
+
+        print(f'bounds : {bounds}')
+        
+
+        colors_lst = np.array([[255, 0, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255]])
+        seg_colors = np.zeros((seg_xyz.shape[0], 3))
+        group_idx = 0
+        epsilon = np.ones(3) * 0.001
+        for part in parts:
+            for subpart in part:
+                j = 0
+                min, max = np.array(bounds[subpart]["min"]), np.array(bounds[subpart]["max"])
+                # print(f'\nGroup {group_idx} - Part : {subpart} - Min : {min} - Max : {max}')
+                for pid, point in enumerate(seg_xyz):
+                    if np.all(point >= (min-epsilon)) and np.all(point <= (max+epsilon)):
+                        seg_colors[pid] = colors_lst[group_idx]
+                        j += 1
+                # print(f"Subpart {subpart} has {j} points")
+            group_idx += 1
+
+        storePly(path, seg_xyz, seg_colors)
+        
+        # create one ply per bound using the min and max to generate the 8 points of the bounding box
+        # bound_color = np.array([255, 255, 255])
+
+        # for key, bound in bounds.items():
+        #     min = bound["min"]
+        #     max = bound["max"]
+        #     bound_xyz = np.array([[min[0], min[1], min[2]], [max[0], min[1], min[2]], [max[0], max[1], min[2]], [min[0], max[1], min[2]], [min[0], min[1], max[2]], [max[0], min[1], max[2]], [max[0], max[1], max[2]], [min[0], max[1], max[2]]])
+        #     bound_colors = np.full((bound_xyz.shape[0], 3), bound_color)
+        #     bound_path = path.replace(".ply", f"_{key}.ply")
+        #     storePly(bound_path, bound_xyz, bound_colors)
+    
+    def save_segmented_ply(self, path):
+        xyz = self._xyz.detach().cpu().numpy()
+        # normals = np.zeros_like(xyz)
+        # f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        # f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        
+        print(f"The minimum group index is {torch.min(self._groups)}")
+
+        groups = self._groups.detach().cpu().numpy()
+
+        # print(f'Shape of fdc : {f_dc.shape}')
+        # print(f'The value of the 100st element of fdc : {f_dc[100]}')
+
+        colors_lst = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]])
+        colors = np.zeros((xyz.shape[0], 3))
+        for group_idx in range(len(self.parts)):
+            group_mask = groups == group_idx
+            color = colors_lst[group_idx]
+            colors[group_mask] = color
+            # f_dc[group_mask] = RGB2SH(color)
+
+        storePly(path, xyz, colors)
+
+        # opacities = self._opacity.detach().cpu().numpy()
+        # scale = self._scaling.detach().cpu().numpy()
+        # rotation = self._rotation.detach().cpu().numpy()
+
+        # dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+        # elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        # attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        # elements[:] = list(map(tuple, attributes))
+        # el = PlyElement.describe(elements, 'vertex')
+
+        # PlyData([el]).write(path)
 #################################################################################################
 #################################################################################################
     
@@ -158,6 +496,7 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
+
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -180,6 +519,8 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
