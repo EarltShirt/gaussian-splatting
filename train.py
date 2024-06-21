@@ -11,6 +11,7 @@
 
 import os
 import torch
+import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -153,28 +154,120 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     #################################################################################################
     ####################################### MY ADDITIONS ############################################
-            # Every 500 iterations, we regroup the gaussians using the boudning boxes
-            if iteration % 500 == 0 and iteration > 1000 and iteration < 7000:
+            # Every 500 iterations, we regroup the gaussians using the bounding boxes
+            if iteration % 500 == 0 and iteration > 2000 and iteration < 10000:
                 print("\n[ITER {}] Regrouping Gaussians".format(iteration))
                 scene.gaussians.regroup_and_prune()
             
-            if iteration == 500:
-                gaussians.regroup_and_prune()
+            if iteration == 2000:
                 print("\n[ITER {}] Group Visualization".format(iteration))
                 segmented_ply_path = os.path.join(scene.model_path, "segmented.ply")    
                 gaussians.save_segmented_ply(segmented_ply_path)
 
+                gaussians.regroup_and_prune()
                 post_segmented_ply_path = os.path.join(scene.model_path, "post_segmented.ply")
-                print("\nStoring the pre-segmetned point cloud at {}".format(segmented_ply_path))
+                print("\nStoring the pre-segmented point cloud at {}".format(segmented_ply_path))
                 print("\nStoring the post-segmented point cloud at {}".format(post_segmented_ply_path))
-                rotation_tensor = torch.tensor([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=torch.float32, device="cpu")
+                gaussians.save_segmented_ply(post_segmented_ply_path)
+                
+                theta = -np.pi / 4
+                ROT = [
+                    [1, 0, 0], 
+                    [0, np.cos(theta), np.sin(theta)], 
+                    [0, -np.sin(theta), np.cos(theta)] ]
+                rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cpu")
                 rotated_ply_path = os.path.join(scene.model_path, "rotated.ply")
                 gaussians.store_rotated_groups(rotated_ply_path, 3, rotation_tensor)
                 print("\nStoring the rotated point cloud at {}".format(rotated_ply_path))
-                gaussians.save_post_segmented_ply(post_segmented_ply_path)
+
+            if iteration == 15501:
+                gaussians.regroup_and_prune()
+                theta = - np.pi / 4
+                ROT = [
+                    [1, 0, 0], 
+                    [0, np.cos(theta), np.sin(theta)], 
+                    [0, -np.sin(theta), np.cos(theta)] ]
+                rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cuda")
+                gaussians.rotate_gaussians(3, rotation_tensor)
+
+            if iteration == 15502:
+                print("\n[ITER {}] Pausing the training for the user to check the results".format(iteration))
+                input("Press Enter to continue...")
+
     #################################################################################################
     #################################################################################################
 
+
+
+    #################################################################################################
+    ####################################### MY ADDITIONS ############################################
+
+
+def shs_fit(dataset, opt, pipe, checkpoint, debug_from):
+    first_iter = 0
+    tb_writer = prepare_output_and_logger(dataset)
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians)
+    gaussians.training_setup(opt)
+    if checkpoint:
+        (model_params, first_iter) = torch.load(checkpoint)
+        gaussians.restore(model_params, opt)
+
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+    iter_start = torch.cuda.Event(enable_timing = True)
+    iter_end = torch.cuda.Event(enable_timing = True)
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    first_iter += 1
+    for iteration in range(first_iter, opt.iterations + 1):        
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                    break
+            except Exception as e:
+                network_gui.conn = None
+
+        iter_start.record()
+
+        gaussians.update_learning_rate(iteration)
+
+
+        # Pick a random Camera
+        if not viewpoint_stack:
+            viewpoint_stack = scene.getTrainCameras().copy()
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        # Render
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+
+        bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+        # Loss
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss.backward()
+
+
+
+    #################################################################################################
+    #################################################################################################
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

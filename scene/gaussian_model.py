@@ -16,10 +16,15 @@ from torch import nn
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import RGB2SH, SH2RGB
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+
+from scipy.spatial.transform import Rotation as R
+import quaternion
+from e3nn import o3
+import einops
 
 # I need this function in order to store the post-segmented point cloud
 def storePly(path, xyz, rgb):
@@ -77,11 +82,12 @@ class GaussianModel:
         self.setup_functions()
 
         # list containing the group index for each gaussian (gaussians 
-        #are supposed to stay in the same order in the _xyz tensor)
+        # are supposed to stay in the same order in the _xyz tensor)
         self._groups = torch.empty(0)
         self.bounds = None
         self.parts = None
-        self.pivots = None
+        self.x_pivots = None
+        self.z_pivots = None
 
 
     def capture(self):
@@ -166,7 +172,16 @@ class GaussianModel:
     def get_pivots(self):
         return self.pivots
     
-    def get_pivot(self, part_idx):
+    def get_x_pivot(self, part_idx):
+        switcher = {
+            1: 'part_1',
+            2: 'part_2',
+            3: 'part_3',
+            4: 'part_4'
+        }
+        return self.x_pivots[switcher.get(part_idx, "Invalid part index")]
+    
+    def get_z_pivot(self, part_idx):
         switcher = {
             1: 'part_1',
             2: 'part_2',
@@ -174,20 +189,32 @@ class GaussianModel:
             4: 'part_4'
         }
         print(f"Calling get_pivot with part_idx : {part_idx}")
-        return self.pivots[switcher.get(part_idx, "Invalid part index")]
+        return self.z_pivots[switcher.get(part_idx, "Invalid part index")]
 
     def define_pivots(self):
-        pivots = {}
+        x_pivots = {}
+        z_pivots = {}
         for group_idx, bound in self.bounds.items():
             if 'part1_angle_l' in group_idx:
-                pivots['part_1'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+                x_pivots['part_1'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
             elif 'part2_angle_l' in group_idx:
-                pivots['part_2'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+                x_pivots['part_2'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
             elif 'part3_angle_l' in group_idx:
-                pivots['part_3'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+                x_pivots['part_3'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
             elif 'part4_angle_l' in group_idx:
-                pivots['part_4'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
-        self.pivots = pivots
+                x_pivots['part_4'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            
+            elif 'part1_angle_h' in group_idx:
+                z_pivots['part_1'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            elif 'part2_angle_h' in group_idx:
+                z_pivots['part_2'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            elif 'part3_angle_h' in group_idx:
+                z_pivots['part_3'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+            elif 'part4_angle_h' in group_idx:
+                z_pivots['part_4'] = (np.array(bound["min"]) + np.array(bound["max"]))/2
+        
+        self.x_pivots = x_pivots
+        self.z_pivots = z_pivots
 
     def rotate_group(self, group_idx : int, rotation : torch.Tensor):
         '''
@@ -201,9 +228,25 @@ class GaussianModel:
         Returns:
             None, the gaussians are rotated in place
         '''
-        pivot_point = self.get_pivot(group_idx)
+        pivot_point = self.get_x_pivot(group_idx)
         group_mask = self._groups >= group_idx
         self._xyz[group_mask] = torch.bmm(rotation, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1) + pivot_point
+
+    def create_rotation_matrix(self, theta, axis):
+        '''
+        Create a rotation matrix around the axis axis by the given angle (in radians)
+        '''
+        if axis == 'x':
+            ROT = [
+                [1, 0, 0], 
+                [0, np.cos(theta), np.sin(theta)], 
+                [0, -np.sin(theta), np.cos(theta)] ]
+        elif axis == 'z':
+            ROT = [
+                [np.cos(theta), np.sin(theta), 0], 
+                [-np.sin(theta), np.cos(theta), 0], 
+                [0, 0, 1] ]
+        return torch.tensor(ROT, dtype=torch.float32, device="cuda")
 
     def rotate_groups_test(self, group_idx : int, rotation : torch.Tensor):
         '''
@@ -215,13 +258,112 @@ class GaussianModel:
         Returns:
             New xyz tensor
         '''
-        pivot_point = torch.tensor(self.get_pivot(group_idx)).cpu().float()
-        xyz = self._xyz.clone().cpu().numpy().float()
+        pivot_point = torch.tensor(self.get_x_pivot(group_idx), dtype=torch.float32, device="cpu")
+        xyz = self._xyz.clone().cpu().float()
         group_mask = (self._groups >= group_idx).cpu()
-        N = xyz[group_mask].shape[0]
+        N = int(group_mask.sum().item())
         rotations = rotation.repeat(N, 1, 1).float()
-        xyz[group_mask] = np.add(torch.bmm(rotations, (xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1).cpu().numpy(), pivot_point.repeat(N, 1).cpu().numpy())
+        xyz[group_mask] = torch.add(torch.bmm(rotations, (xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1).cpu(), pivot_point.repeat(N, 1).cpu())
         return xyz, group_mask
+
+    def store_rotated_groups(self, path : str, group_idx : int, rotation : torch.Tensor):
+        self.define_pivots()
+        rotated_xyz, rotated_mask = self.rotate_groups_test(group_idx, rotation)
+        colors = np.zeros((rotated_xyz.shape[0], 3))
+        colors[rotated_mask] = np.array([128, 0, 128])
+        storePly(path, rotated_xyz.detach().cpu().numpy(), colors)
+
+    # method found inn the issues of the inria/3DGS github repo
+    def transform_shs(self, shs_feat, rotation_matrix):
+
+        # rotate shs
+        # P = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]]) # switch axes: yzx -> xyz
+        # P = np.array([[0, 0, 1], [-1, 0, 0], [0, 1, 0]])
+        # permuted_rotation_matrix = np.linalg.inv(P) @ rotation_matrix @ P
+        rot_angles = o3._rotation.matrix_to_angles(torch.from_numpy(rotation_matrix))
+        # rot_angles = o3._rotation.matrix_to_angles(torch.from_numpy(permuted_rotation_matrix))
+
+        
+        # Construction coefficient
+        D_1 = o3.wigner_D(1, rot_angles[0], - rot_angles[1], rot_angles[2]).float()
+        D_2 = o3.wigner_D(2, rot_angles[0], - rot_angles[1], rot_angles[2]).float()
+        D_3 = o3.wigner_D(3, rot_angles[0], - rot_angles[1], rot_angles[2]).float()
+
+        #rotation of the shs features
+        one_degree_shs = shs_feat[:, 0:3]
+        one_degree_shs = einops.rearrange(one_degree_shs, 'n shs_num rgb -> n rgb shs_num')
+        one_degree_shs = einops.einsum(
+                D_1,
+                one_degree_shs.cpu().float(),
+                "... i j, ... j -> ... i",
+            )
+        one_degree_shs = einops.rearrange(one_degree_shs, 'n rgb shs_num -> n shs_num rgb')
+        shs_feat[:, 0:3] = one_degree_shs
+
+        two_degree_shs = shs_feat[:, 3:8]
+        two_degree_shs = einops.rearrange(two_degree_shs, 'n shs_num rgb -> n rgb shs_num')
+        two_degree_shs = einops.einsum(
+                D_2,
+                two_degree_shs.cpu().float(),
+                "... i j, ... j -> ... i",
+            )
+        two_degree_shs = einops.rearrange(two_degree_shs, 'n rgb shs_num -> n shs_num rgb')
+        shs_feat[:, 3:8] = two_degree_shs
+
+        three_degree_shs = shs_feat[:, 8:15]
+        three_degree_shs = einops.rearrange(three_degree_shs, 'n shs_num rgb -> n rgb shs_num')
+        three_degree_shs = einops.einsum(
+                D_3,
+                three_degree_shs.cpu().float(),
+                "... i j, ... j -> ... i",
+            )
+        three_degree_shs = einops.rearrange(three_degree_shs, 'n rgb shs_num -> n shs_num rgb')
+        shs_feat[:, 8:15] = three_degree_shs
+
+        return shs_feat
+
+    def rotate_gaussians(self, group_idx : int, rotation : torch.Tensor):
+        self.regroup_and_prune()
+        self.define_pivots()
+        pivot_point = torch.tensor(self.get_x_pivot(group_idx), dtype=torch.float, device="cuda")
+        group_mask = self._groups >= group_idx
+        N = int(group_mask.sum().item())
+        rotations = rotation.repeat(N, 1, 1).float()
+        bmm = torch.bmm(rotations, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1)
+        repeated_pivot = pivot_point.repeat(N, 1).float()
+        self._xyz[group_mask] = torch.add(bmm, repeated_pivot).float()
+
+        
+        test = self._rotation[100:110]
+        r = build_rotation(test).double()
+        rot_angles = o3._rotation.matrix_to_quaternion(r.cpu())
+        print(f'\n\nQuaternions before using o3 :\n{test.double().cpu().numpy()}')
+        print(f'Quaternions after using o3  :\n{rot_angles.double().cpu().numpy()}')
+        print(f'Difference between the two methods : \n{(rot_angles - test.cpu()).cpu().numpy()}')
+        print(f'Norm of the difference : {torch.norm(rot_angles - test.cpu())}')
+        print(f'Difference between the two methods with 3/4: \n{(rot_angles*3/4 - test.cpu()).cpu().numpy()}')
+        print(f'Norm of the difference with 3/4: {torch.norm(rot_angles*3/4 - test.cpu())}')
+        
+        
+        
+        # same but for the internal rotation of the gaussians
+        rotations = rotation.repeat(N, 1, 1).double()
+        rotated_rotations = build_rotation(self._rotation[group_mask]).double()
+        rotated_rotations = torch.bmm(rotations, rotated_rotations)
+        # angles = R.from_matrix(rotated_rotations.cpu().numpy()).as_quat()
+        # angles = -1 * quaternion.as_float_array(quaternion.from_rotation_matrix(rotated_rotations.cpu().numpy()))
+        angles = o3._rotation.matrix_to_quaternion(rotated_rotations.cpu()).float()
+        # angles = [angle if angle[0] >= 0 else -1*angle for angle in angles]
+        self._rotation[group_mask] = angles.to(device="cuda")
+        
+        # Now we will rotate the features_dc and features_rest
+        # print(f'shape of features_rest : {self._features_rest.shape}')
+        theta = -np.pi / 4
+        ROT = np.array([
+                [1, 0, 0], 
+                [0, np.cos(theta), np.sin(theta)], 
+                [0, -np.sin(theta), np.cos(theta)] ])
+        self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], ROT)
 
     def prune_points_groups(self, mask):
         valid_points_mask = ~mask
@@ -360,7 +502,7 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def Regroup_Gaussians(self):
+    def regroup_gaussians(self):
         '''
         Reassings the groups to the gaussians based on their position using the
         associated bounds (group_idxc in [1, #groups], -1 for environment, 0 for no group)
@@ -368,7 +510,6 @@ class GaussianModel:
 
         epsilon = np.ones(3) * 0.001
         groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
-        # self._groups = torch.zeros((self._xyz.shape[0]), device="cuda")
         xyz = self._xyz.detach().cpu().numpy()
 
         for group_idx, bound in self.bounds.items():
@@ -382,77 +523,25 @@ class GaussianModel:
                 idx = 4
             else :
                 idx = 0
-            # group mask using numpy
-            # if idx ==1 :
-            #     print(f'\nxyz[100:110] :\n {xyz[2000:2020]} \n and the mininum bound :\n {np.array(bound["min"]) - epsilon}')
-            #     print(f'Testing the np.all method : {np.all(xyz[100:110] >= np.array(bound["min"]) - epsilon, axis=1)}')
-            # if idx == 4:
-            #     print(f'\nxyz[100:110] :\n {xyz[2000:2020]} \n and the mininum bound :\n {np.array(bound["min"]) - epsilon}')
-            #     print(f'Testing the np.all method : {np.all(xyz[100:110] >= np.array(bound["min"]) - epsilon, axis=1)}')
-            # group_mask = np.all(xyz >= np.array(bound["min"]) - epsilon, axis=1) & np.all(xyz <= np.array(bound["max"]) + epsilon, axis=1)
-            # print(f'Group {idx} - Part : {group_idx} - Min : {bound["min"]} - Max : {bound["max"]} : {np.sum(group_mask)} points')
-            # self._groups[group_mask] = idx
             group_mask = torch.where(
                 torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"])).to(device="cuda"), dim=1), True, False
             )
             group_mask = torch.logical_and(group_mask, torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"])).to(device="cuda"), dim=1))
             groups[group_mask] = idx
-
         self._groups = groups
 
-    def regroup_gaussians(self):
-        '''
-        Reassings the groups to the gaussians based on their position using the
-        associated bounds (group_idxc in [1, #groups], -1 for environment, 0 for no group)
-        '''
-
-        # groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
-
-        epsilon = np.ones(3) * 0.001
-        self._groups = torch.zeros((self._xyz.shape[0], ), device="cuda")
-
-        for group_idx, bound in self.bounds.items():
-            if 'part1' in group_idx:
-                idx = 1
-            elif 'part2' in group_idx:
-                idx = 2
-            elif 'part3' in group_idx:
-                idx = 3
-            elif 'part4' in group_idx:
-                idx = 4
-            else :
-                idx = 0
-            
-            # group_mask = torch.where(
-            #     torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"])).to(device="cuda"), dim=1), True, False
-            # )
-            # group_mask = torch.logical_and(group_mask, torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"])).to(device="cuda"), dim=1))
-            # groups[group_mask] = idx
-            group_mask = torch.logical_and(torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"]) - epsilon).to(device="cuda"), dim=1), torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"]) + epsilon).to(device="cuda"), dim=1))
-            self._groups[group_mask] = idx
-            print(f'Group {idx} - Part : {group_idx} - Min : {bound["min"]} - Max : {bound["max"]} : {torch.sum(group_mask)} points')
-        
     def regroup_and_prune(self):
         '''
         Removes the points that are not assigned to any group
         '''
         n_gaussians = self.get_xyz.shape[0]
-        # self.regroup_gaussians()
-        self.Regroup_Gaussians()
+        self.regroup_gaussians()
         group_mask = self._groups == 0
-        # valid_points_mask = ~group_mask
-        # print(f"The minimum group index before pruning is {torch.min(self._groups)}")
-
         self.prune_points_groups(group_mask)
-
-        # print(f"The minimum group index after pruning is {torch.min(self._groups)}")
         print(f'Pruned {n_gaussians - self.get_xyz.shape[0]} points')
 
     def save_post_segmented_ply(self, path):
         seg_xyz = self._xyz.detach().cpu().numpy()
-        # seg_normals = np.zeros_like(seg_xyz)
-
-        # groups = self._groups.detach().cpu().numpy()
 
         bounds = self.bounds
         parts = self.parts
@@ -476,28 +565,21 @@ class GaussianModel:
 
         storePly(path, seg_xyz, seg_colors)
         
-        bound_color = np.array([255, 255, 255])
+        # bound_color = np.array([255, 255, 255])
 
-        for key, bound in bounds.items():
-            min = bound["min"]
-            max = bound["max"]
-            bound_xyz = np.array([[min[0], min[1], min[2]], [max[0], min[1], min[2]], [max[0], max[1], min[2]], [min[0], max[1], min[2]], [min[0], min[1], max[2]], [max[0], min[1], max[2]], [max[0], max[1], max[2]], [min[0], max[1], max[2]]])
-            bound_colors = np.full((bound_xyz.shape[0], 3), bound_color)
-            bound_path = path.replace(".ply", f"_{key}.ply")
-            storePly(bound_path, bound_xyz, bound_colors)
+        # for key, bound in bounds.items():
+        #     min = bound["min"]
+        #     max = bound["max"]
+        #     bound_xyz = np.array([[min[0], min[1], min[2]], [max[0], min[1], min[2]], [max[0], max[1], min[2]], [min[0], max[1], min[2]], [min[0], min[1], max[2]], [max[0], min[1], max[2]], [max[0], max[1], max[2]], [min[0], max[1], max[2]]])
+        #     bound_colors = np.full((bound_xyz.shape[0], 3), bound_color)
+        #     bound_path = path.replace(".ply", f"_{key}.ply")
+        #     storePly(bound_path, bound_xyz, bound_colors)
     
     def save_segmented_ply(self, path):
         xyz = self._xyz.detach().cpu().numpy()
-        # normals = np.zeros_like(xyz)
-        # f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        # f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        
         print(f"The minimum group index is {torch.min(self._groups)}")
 
         groups = self._groups.detach().cpu().numpy()
-
-        # print(f'Shape of fdc : {f_dc.shape}')
-        # print(f'The value of the 100st element of fdc : {f_dc[100]}')
 
         colors_lst = np.array([[0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]])
         colors = np.zeros((xyz.shape[0], 3))
@@ -505,29 +587,9 @@ class GaussianModel:
             group_mask = groups == group_idx
             color = colors_lst[group_idx]
             colors[group_mask] = color
-            # f_dc[group_mask] = RGB2SH(color)
 
         storePly(path, xyz, colors)
 
-        # opacities = self._opacity.detach().cpu().numpy()
-        # scale = self._scaling.detach().cpu().numpy()
-        # rotation = self._rotation.detach().cpu().numpy()
-
-        # dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
-
-        # elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        # attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
-        # elements[:] = list(map(tuple, attributes))
-        # el = PlyElement.describe(elements, 'vertex')
-
-        # PlyData([el]).write(path)
-
-    def store_rotated_groups(self, path : str, group_idx : int, rotation : torch.Tensor):
-        self.define_pivots()
-        rotated_xyz, rotated_mask = self.rotate_groups_test(group_idx, rotation)
-        colors = np.zeros((rotated_xyz.shape[0], 3))
-        colors[rotated_mask] = np.array([128, 0, 128])
-        storePly(path, rotated_xyz.detach().cpu().numpy(), colors)
 #################################################################################################
 #################################################################################################
     

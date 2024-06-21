@@ -75,7 +75,7 @@ def rewrite_data(input_path, output_path):
     N_images = len(extrinsic_matrices)
 
     test_indices = random.sample(range(N_images), 20)
-    val_indices = random.sample(set(range(N_images)) - set(test_indices), 10)
+    val_indices = random.sample(list(set(range(N_images)) - set(test_indices)), 10)
     
     train_iterator = 1
     test_iterator = 1

@@ -266,6 +266,18 @@ def segment_from_ply(bounds, num_pts, path, gaussians):
     for bound in bounds.values():
         bound["min"] = np.array(bound["min"])
         bound["max"] = np.array(bound["max"])
+    
+    # temporaty fix for the bounds of the part4 (the 3DGS representation is not accurate for this part, elongates it a bit)
+    # for idx, bound in bounds.items():
+    #     if 'part1' in idx:
+    #         bound["min"] -= np.array([0.0, 0.06, 0.00])
+    #     if 'part2' in idx:
+    #         bound["min"] -= np.array([0.0, 0.02, 0.02])
+    #         bound["max"] += np.array([0.01, 0.0, 0.0])
+    #     if 'part3' in idx:
+    #         bound["max"] += np.array([0.02, 0.02, 0.02])
+    #     if 'part4' in idx:
+    #         bound["max"] += np.array([0.05, 0.05, 0.05])
 
     # epsilon = np.ones(3) * 10e-4
 
@@ -281,24 +293,26 @@ def segment_from_ply(bounds, num_pts, path, gaussians):
     #     bound["max"][0] = bound["max"][2]
     #     bound["max"][2] = tmp
 
-    # shiftx = 0.03
-    # shifty = 0.60
-    # shiftz = -0.005
+    # shiftx = 0.02
+    # shifty = 0.01
+    # shiftz = 0.0
     # scale = 0.60
 
     # for bound in bounds.values():
-    #     bound["min"] = np.array([bound["min"][0] + shiftx, bound["min"][1] + shifty, bound["min"][2] + shiftz]) * scale
-    #     bound["max"] = np.array([bound["max"][0] + shiftx, bound["max"][1] + shifty, bound["max"][2] + shiftz]) * scale
+    #     bound["min"] = np.array([bound["min"][0] + shiftx, bound["min"][1] + shifty, bound["min"][2] + shiftz])
+    #     bound["max"] = np.array([bound["max"][0] + shiftx, bound["max"][1] + shifty, bound["max"][2] + shiftz])
 
     
-    # save it to tmp_bounds as a dictionnary of arrays 
+    # # save it to tmp_bounds as a dictionnary of arrays 
     # tmp_bounds = {}
     # for key in bounds.keys():
     #     min = [bounds[key]["min"][0], bounds[key]["min"][1], bounds[key]["min"][2]]
     #     max = [bounds[key]["max"][0], bounds[key]["max"][1], bounds[key]["max"][2]]
     #     tmp_bounds[key] = {"min": min, "max": max}
 
+    # bounds_path = os.path.join(path, "tmp_bounds.json")
     # save_bounds(bounds_path, tmp_bounds)    
+    # print(f'\nBounds saved at {bounds_path}\n')
 
     pcd = fetchPly(ply_path)
     points = pcd.points
