@@ -11,6 +11,9 @@
 
 import os
 import torch
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten, Reshape, Layer
+from tensorflow.keras.models import Model
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -199,9 +202,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
 
 
-    #################################################################################################
-    ####################################### MY ADDITIONS ############################################
-
+#################################################################################################
+####################################### MY ADDITIONS ############################################
 
 def shs_fit(dataset, opt, pipe, checkpoint, debug_from):
     first_iter = 0
@@ -266,8 +268,58 @@ def shs_fit(dataset, opt, pipe, checkpoint, debug_from):
 
 
 
-    #################################################################################################
-    #################################################################################################
+def template():
+    class DifferentiableRenderer(Layer):
+        def call(self, sh_coeff):
+            rendered_image = ...  
+            return rendered_image
+
+    # Define the input layers
+    rotation_angle_input = Input(shape=(1,), name='rotation_angle')  # Modify shape if more angles are used
+    sh_coeff_input = Input(shape=(N, 16, 3), name='sh_coefficients')
+
+    # Flatten the SH coefficients input
+    sh_coeff_flat = Flatten()(sh_coeff_input)
+
+    # Process rotation angle input
+    rotation_dense = Dense(64, activation='relu')(rotation_angle_input)
+    rotation_dense = Dense(64, activation='relu')(rotation_dense)
+
+    # Process SH coefficients input
+    sh_dense = Dense(512, activation='relu')(sh_coeff_flat)
+    sh_dense = Dense(512, activation='relu')(sh_dense)
+
+    # Concatenate processed rotation angle and SH coefficients
+    concat = Concatenate()([rotation_dense, sh_dense])
+
+    # Further processing after concatenation
+    hidden = Dense(512, activation='relu')(concat)
+    hidden = Dense(512, activation='relu')(hidden)
+
+    # Define the output layer (reshaped to match SH coefficients dimensions)
+    adjusted_sh_coeff_flat = Dense(N * 16 * 3)(hidden)
+    adjusted_sh_coeff = Reshape((N, 16, 3))(adjusted_sh_coeff_flat)
+
+    # Apply the differentiable renderer to the adjusted SH coefficients
+    rendered_image = DifferentiableRenderer()(adjusted_sh_coeff)
+
+    # Build the model
+    model = Model(inputs=[rotation_angle_input, sh_coeff_input], outputs=rendered_image)
+
+    # Compile the model with the desired loss functions
+    def custom_loss(y_true, y_pred):
+        l1_loss = tf.reduce_mean(tf.abs(y_true - y_pred))
+        ssim_loss = 1 - tf.reduce_mean(tf.image.ssim(y_true, y_pred, max_val=1.0))
+        psnr_loss = -tf.reduce_mean(tf.image.psnr(y_true, y_pred, max_val=1.0))
+        return l1_loss + ssim_loss + psnr_loss
+
+    model.compile(optimizer='adam', loss=custom_loss)
+
+    # Train the model
+    model.fit([rotation_angles, sh_coefficients], ground_truth_images, epochs=100, batch_size=32, validation_split=0.2)
+
+#################################################################################################
+#################################################################################################
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
