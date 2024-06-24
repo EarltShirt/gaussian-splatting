@@ -183,7 +183,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.store_rotated_groups(rotated_ply_path, 3, rotation_tensor)
                 print("\nStoring the rotated point cloud at {}".format(rotated_ply_path))
 
-            if iteration == 15501:
+            if iteration == 8501:
                 gaussians.regroup_and_prune()
                 theta = - np.pi / 4
                 ROT = [
@@ -191,9 +191,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     [0, np.cos(theta), np.sin(theta)], 
                     [0, -np.sin(theta), np.cos(theta)] ]
                 rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cuda")
-                gaussians.rotate_gaussians(3, rotation_tensor)
+                gaussians.rotate_gaussians(3, theta, axis='x')
 
-            if iteration == 15502:
+            if iteration == 8502:
                 print("\n[ITER {}] Pausing the training for the user to check the results".format(iteration))
                 input("Press Enter to continue...")
 

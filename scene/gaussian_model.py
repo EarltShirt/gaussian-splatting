@@ -247,6 +247,16 @@ class GaussianModel:
                 [-np.sin(theta), np.cos(theta), 0], 
                 [0, 0, 1] ]
         return torch.tensor(ROT, dtype=torch.float32, device="cuda")
+    
+    def create_rotation_quaternion(self, theta, axis):
+        '''
+        Create a rotation quaternion around the axis axis by the given angle (in radians)
+        '''
+        if axis == 'x':
+            ROT = [np.cos(theta/2), np.sin(theta/2), 0, 0]
+        elif axis == 'z':
+            ROT = [np.cos(theta/2), 0, 0, np.sin(theta/2)]
+        return torch.tensor(ROT, dtype=torch.float32, device="cpu")
 
     def rotate_groups_test(self, group_idx : int, rotation : torch.Tensor):
         '''
@@ -274,20 +284,25 @@ class GaussianModel:
         storePly(path, rotated_xyz.detach().cpu().numpy(), colors)
 
     # method found inn the issues of the inria/3DGS github repo
-    def transform_shs(self, shs_feat, rotation_matrix):
-
+    # def transform_shs(self, shs_feat, rotation_matrix):
+    def transform_shs(self, shs_feat, theta, axis):
         # rotate shs
         # P = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]]) # switch axes: yzx -> xyz
         # P = np.array([[0, 0, 1], [-1, 0, 0], [0, 1, 0]])
         # permuted_rotation_matrix = np.linalg.inv(P) @ rotation_matrix @ P
-        rot_angles = o3._rotation.matrix_to_angles(torch.from_numpy(rotation_matrix))
         # rot_angles = o3._rotation.matrix_to_angles(torch.from_numpy(permuted_rotation_matrix))
-
-        
-        # Construction coefficient
+        rotation_matrix = self.create_rotation_matrix(theta, axis).cpu().numpy()
+        rot_angles = o3._rotation.matrix_to_angles(torch.from_numpy(rotation_matrix))
         D_1 = o3.wigner_D(1, rot_angles[0], - rot_angles[1], rot_angles[2]).float()
         D_2 = o3.wigner_D(2, rot_angles[0], - rot_angles[1], rot_angles[2]).float()
         D_3 = o3.wigner_D(3, rot_angles[0], - rot_angles[1], rot_angles[2]).float()
+
+        # Using custom quaternion construction
+        # rot_angles = self.create_rotation_quaternion(theta, axis)
+        # # Construction coefficient
+        # D_1 = o3.wigner_D(1, rot_angles[0], rot_angles[1], rot_angles[2]).float()
+        # D_2 = o3.wigner_D(2, rot_angles[0], rot_angles[1], rot_angles[2]).float()
+        # D_3 = o3.wigner_D(3, rot_angles[0], rot_angles[1], rot_angles[2]).float()
 
         #rotation of the shs features
         one_degree_shs = shs_feat[:, 0:3]
@@ -322,19 +337,20 @@ class GaussianModel:
 
         return shs_feat
 
-    def rotate_gaussians(self, group_idx : int, rotation : torch.Tensor):
+    def rotate_gaussians(self, group_idx : int, theta : float, axis : str):
         self.regroup_and_prune()
         self.define_pivots()
         pivot_point = torch.tensor(self.get_x_pivot(group_idx), dtype=torch.float, device="cuda")
         group_mask = self._groups >= group_idx
         N = int(group_mask.sum().item())
+        rotation = self.create_rotation_matrix(theta, axis)
         rotations = rotation.repeat(N, 1, 1).float()
         bmm = torch.bmm(rotations, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1)
         repeated_pivot = pivot_point.repeat(N, 1).float()
         self._xyz[group_mask] = torch.add(bmm, repeated_pivot).float()
 
         
-        test = self._rotation[100:110]
+        test = self._rotation[100:110].clone()
         r = build_rotation(test).double()
         rot_angles = o3._rotation.matrix_to_quaternion(r.cpu())
         print(f'\n\nQuaternions before using o3 :\n{test.double().cpu().numpy()}')
@@ -345,25 +361,19 @@ class GaussianModel:
         print(f'Norm of the difference with 3/4: {torch.norm(rot_angles*3/4 - test.cpu())}')
         
         
-        
         # same but for the internal rotation of the gaussians
         rotations = rotation.repeat(N, 1, 1).double()
         rotated_rotations = build_rotation(self._rotation[group_mask]).double()
         rotated_rotations = torch.bmm(rotations, rotated_rotations)
-        # angles = R.from_matrix(rotated_rotations.cpu().numpy()).as_quat()
-        # angles = -1 * quaternion.as_float_array(quaternion.from_rotation_matrix(rotated_rotations.cpu().numpy()))
         angles = o3._rotation.matrix_to_quaternion(rotated_rotations.cpu()).float()
-        # angles = [angle if angle[0] >= 0 else -1*angle for angle in angles]
         self._rotation[group_mask] = angles.to(device="cuda")
         
         # Now we will rotate the features_dc and features_rest
         # print(f'shape of features_rest : {self._features_rest.shape}')
-        theta = -np.pi / 4
-        ROT = np.array([
-                [1, 0, 0], 
-                [0, np.cos(theta), np.sin(theta)], 
-                [0, -np.sin(theta), np.cos(theta)] ])
-        self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], ROT)
+        # theta = -np.pi / 4
+        # ROT = self.create_rotation_matrix(theta, 'z')
+        # self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], ROT)
+        self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], theta, axis)
 
     def prune_points_groups(self, mask):
         valid_points_mask = ~mask
