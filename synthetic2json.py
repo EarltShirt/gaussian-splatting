@@ -51,8 +51,8 @@ def get_data(input_path):
     return extrinsic_matrices, intrinsics_matrices, array_data
 
 
-def rewrite_data(input_path, output_path):
-    extrinsic_matrices, intrinsics_matrices, array_data = get_data(input_path)
+def rewrite_data(images, output_path, matrix_path):
+    extrinsic_matrices, intrinsics_matrices, array_data = get_data(matrix_path)
 
     test_dir = os.path.join(output_path, "test")
     val_dir = os.path.join(output_path, "val")
@@ -74,8 +74,8 @@ def rewrite_data(input_path, output_path):
 
     N_images = len(extrinsic_matrices)
 
-    test_indices = random.sample(range(N_images), 20)
-    val_indices = random.sample(list(set(range(N_images)) - set(test_indices)), 10)
+    test_indices = random.sample(range(1,N_images), 20)
+    val_indices = random.sample(list(set(range(1,N_images)) - set(test_indices)), 10)
     
     train_iterator = 1
     test_iterator = 1
@@ -85,7 +85,7 @@ def rewrite_data(input_path, output_path):
     print(f'intrinsic_matrix : \n {intrinsics_matrices[0]}')
 
     for i in range(N_images):
-        image_old_name = os.path.join(input_path, f"camera{i}.png")
+        image_old_name = os.path.join(images, f"image_{(i+1):04d}.png")
 
         w, fl_x = intrinsics_matrices[i][0], intrinsics_matrices[i][2]
         h, fl_y = intrinsics_matrices[i][1], intrinsics_matrices[i][2]
@@ -140,8 +140,24 @@ def rewrite_data(input_path, output_path):
 
     return train_frames, test_frames, val_frames, camera_angles_train, camera_angles_test, camera_angles_val
 
-def generate_json(input_path, output_path):
-    train_frames, test_frames, val_frames, camera_angles_train, camera_angles_test, camera_angles_val = rewrite_data(input_path, output_path)
+def rewrite_images_other_angles(matrix_path, output_path):
+    # copy the folder and its content for each folder in the matrix_path
+    for folder in os.listdir(matrix_path):
+        if not os.path.isdir(os.path.join(matrix_path, folder)):
+            continue
+        folder_path = os.path.join(matrix_path, folder)
+        output_folder = os.path.join(output_path, folder)
+        print(f'Folder path: {folder_path}')
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+        for file in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file)
+            output_file = os.path.join(output_folder, file)
+            shutil.copy(file_path, output_file)
+
+
+def generate_json(images, output_path, matrix_path):
+    train_frames, test_frames, val_frames, camera_angles_train, camera_angles_test, camera_angles_val = rewrite_data(images, output_path, matrix_path)
 
     train_frames = [{**frame_data, "transform_matrix": frame_data["transform_matrix"].tolist()} for frame_data in train_frames]
     test_frames = [{**frame_data, "transform_matrix": frame_data["transform_matrix"].tolist()} for frame_data in test_frames]
@@ -182,10 +198,13 @@ def generate_json(input_path, output_path):
     with open(os.path.join(output_path, "transforms_val.json"), 'w') as f:
         json.dump(val_data, f, indent=4)
 
+    rewrite_images_other_angles(matrix_path, output_path)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate json files from txt files')
-    parser.add_argument('--path', type=str, help='Path to the directory containing the txt and png files')
+    parser.add_argument('--images', type=str, help='Path to the directory containing the txt and png files')
     parser.add_argument('--output', type=str, help='Path to the directory where the json files will be saved')
+    parser.add_argument('--matrices', type=str, help='Path to the directory where the json files will be saved')
     args = parser.parse_args()
 
-    generate_json(args.path, args.output)
+    generate_json(args.images, args.output, args.matrices)
