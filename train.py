@@ -160,42 +160,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 ####################################### MY ADDITIONS ############################################
 
             # Every 500 iterations, we regroup the gaussians using the bounding boxes
-            if iteration % 500 == 0 and iteration > 2000 and iteration < 10000:
-                print("\n[ITER {}] Regrouping Gaussians".format(iteration))
-                scene.gaussians.regroup_and_prune()
+            # if iteration % 500 == 0 and iteration > 2000 and iteration < 10000:
+            #     print("\n[ITER {}] Regrouping Gaussians".format(iteration))
+            #     scene.gaussians.regroup_and_prune()
             
-            if iteration == 2000:
+            if iteration == 8000:
                 print("\n[ITER {}] Group Visualization".format(iteration))
                 segmented_ply_path = os.path.join(scene.model_path, "segmented.ply")    
                 gaussians.save_segmented_ply(segmented_ply_path)
 
-                gaussians.regroup_and_prune()
+                # gaussians.regroup_and_prune()
                 post_segmented_ply_path = os.path.join(scene.model_path, "post_segmented.ply")
+                gaussians.save_post_segmented_ply(post_segmented_ply_path)
+
                 print("\nStoring the pre-segmented point cloud at {}".format(segmented_ply_path))
                 print("\nStoring the post-segmented point cloud at {}".format(post_segmented_ply_path))
-                gaussians.save_segmented_ply(post_segmented_ply_path)
                 
-                theta = -np.pi / 4
-                ROT = [
-                    [1, 0, 0], 
-                    [0, np.cos(theta), np.sin(theta)], 
-                    [0, -np.sin(theta), np.cos(theta)] ]
-                rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cpu")
-                rotated_ply_path = os.path.join(scene.model_path, "rotated.ply")
-                gaussians.store_rotated_groups(rotated_ply_path, 3, rotation_tensor)
-                print("\nStoring the rotated point cloud at {}".format(rotated_ply_path))
+                # theta = -np.pi / 4
+                # ROT = [
+                #     [1, 0, 0], 
+                #     [0, np.cos(theta), np.sin(theta)], 
+                #     [0, -np.sin(theta), np.cos(theta)] ]
+                # rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cpu")
+                # rotated_ply_path = os.path.join(scene.model_path, "rotated.ply")
+                # gaussians.store_rotated_groups(rotated_ply_path, 3, rotation_tensor)
+                # print("\nStoring the rotated point cloud at {}".format(rotated_ply_path))
 
-            if iteration == 8501:
+            if iteration == 25501:
                 gaussians.regroup_and_prune()
                 theta = - np.pi / 4
-                ROT = [
-                    [1, 0, 0], 
-                    [0, np.cos(theta), np.sin(theta)], 
-                    [0, -np.sin(theta), np.cos(theta)] ]
-                rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cuda")
+                # rotation_tensor = torch.tensor(ROT, dtype=torch.float, device="cuda")
                 gaussians.rotate_gaussians(3, theta, axis='x')
 
-            if iteration == 8502:
+            if iteration == 25502:
                 print("\n[ITER {}] Pausing the training for the user to check the results".format(iteration))
                 input("Press Enter to continue...")
     

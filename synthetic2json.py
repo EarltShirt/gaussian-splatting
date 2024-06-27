@@ -6,6 +6,11 @@ import math
 import json
 import random
 
+N_images = 120
+test_indices = random.sample(range(1,N_images), 20)
+val_indices = random.sample(list(set(range(1,N_images)) - set(test_indices)), 10)
+
+
 def unity2dnerf_coordinates(extrinsic_matrix):
     new_extrinsic_matrix = np.copy(extrinsic_matrix)
     new_extrinsic_matrix[0, :3] = extrinsic_matrix[2,:3]
@@ -42,7 +47,6 @@ def get_data(input_path):
     for file in os.listdir(input_path):
         filename = os.fsdecode(file)
         if filename.endswith(".txt"):
-            print(f'Processing file: {filename}')
             matrix1, intrinsic, array = load_data(os.path.join(input_path, filename))
             extrinsic_matrices.append(matrix1)
             intrinsics_matrices.append(intrinsic)
@@ -74,15 +78,10 @@ def rewrite_data(images, output_path, matrix_path):
 
     N_images = len(extrinsic_matrices)
 
-    test_indices = random.sample(range(1,N_images), 20)
-    val_indices = random.sample(list(set(range(1,N_images)) - set(test_indices)), 10)
     
     train_iterator = 1
     test_iterator = 1
     val_iterator = 1
-
-    print(f'extrinsic_matrices[5] :\n {extrinsic_matrices[5]}')
-    print(f'intrinsic_matrix : \n {intrinsics_matrices[0]}')
 
     for i in range(N_images):
         image_old_name = os.path.join(images, f"image_{(i+1):04d}.png")
@@ -140,21 +139,6 @@ def rewrite_data(images, output_path, matrix_path):
 
     return train_frames, test_frames, val_frames, camera_angles_train, camera_angles_test, camera_angles_val
 
-def rewrite_images_other_angles(matrix_path, output_path):
-    # copy the folder and its content for each folder in the matrix_path
-    for folder in os.listdir(matrix_path):
-        if not os.path.isdir(os.path.join(matrix_path, folder)):
-            continue
-        folder_path = os.path.join(matrix_path, folder)
-        output_folder = os.path.join(output_path, folder)
-        print(f'Folder path: {folder_path}')
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-        for file in os.listdir(folder_path):
-            file_path = os.path.join(folder_path, file)
-            output_file = os.path.join(output_folder, file)
-            shutil.copy(file_path, output_file)
-
 
 def generate_json(images, output_path, matrix_path):
     train_frames, test_frames, val_frames, camera_angles_train, camera_angles_test, camera_angles_val = rewrite_data(images, output_path, matrix_path)
@@ -198,13 +182,23 @@ def generate_json(images, output_path, matrix_path):
     with open(os.path.join(output_path, "transforms_val.json"), 'w') as f:
         json.dump(val_data, f, indent=4)
 
-    rewrite_images_other_angles(matrix_path, output_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate json files from txt files')
-    parser.add_argument('--images', type=str, help='Path to the directory containing the txt and png files')
+    parser.add_argument('--path', type=str, help='Path to the directory containing the txt and png files')
     parser.add_argument('--output', type=str, help='Path to the directory where the json files will be saved')
-    parser.add_argument('--matrices', type=str, help='Path to the directory where the json files will be saved')
     args = parser.parse_args()
 
-    generate_json(args.images, args.output, args.matrices)
+    path = args.path
+    output_path = args.output
+
+    for folder in os.listdir(path):
+        # check if the folder is a directory
+        if os.path.isdir(os.path.join(path, folder)):
+            print(f'Processing folder: {folder}')
+            # check if the associated output folder exists
+            if not os.path.exists(os.path.join(output_path, folder)):
+                os.makedirs(os.path.join(output_path, folder))
+            generate_json(os.path.join(path, folder), os.path.join(output_path, folder), path)
+        else:
+            continue

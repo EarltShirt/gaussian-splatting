@@ -269,15 +269,16 @@ def segment_from_ply(bounds, num_pts, path, gaussians):
     
     # temporaty fix for the bounds of the part4 (the 3DGS representation is not accurate for this part, elongates it a bit)
     # for idx, bound in bounds.items():
-    #     if 'part1' in idx:
-    #         bound["min"] -= np.array([0.0, 0.06, 0.00])
-    #     if 'part2' in idx:
-    #         bound["min"] -= np.array([0.0, 0.02, 0.02])
-    #         bound["max"] += np.array([0.01, 0.0, 0.0])
-    #     if 'part3' in idx:
-    #         bound["max"] += np.array([0.02, 0.02, 0.02])
-    #     if 'part4' in idx:
-    #         bound["max"] += np.array([0.05, 0.05, 0.05])
+        # if 'part1' in idx:
+        #     bound["min"] -= np.array([0.0, 0.06, 0.00])
+        # if 'part2' in idx:
+        #     bound["min"] -= np.array([0.0, 0.02, 0.02])
+        #     bound["max"] += np.array([0.01, 0.0, 0.0])
+        # if 'part3' in idx:
+        #     bound["min"] += np.array([-0.02, 0.0, -0.02])
+        #     bound["max"] += np.array([0.0, 0.04, 0.0])
+        # if 'part4' in idx:
+        #     bound["max"] += np.array([0.05, 0.05, 0.05])
 
     # epsilon = np.ones(3) * 10e-4
 
@@ -293,14 +294,14 @@ def segment_from_ply(bounds, num_pts, path, gaussians):
     #     bound["max"][0] = bound["max"][2]
     #     bound["max"][2] = tmp
 
-    # shiftx = 0.02
-    # shifty = 0.01
+    # shiftx = 0.05
+    # shifty = -0.05
     # shiftz = 0.0
-    # scale = 0.60
+    # scale = 1.0
 
     # for bound in bounds.values():
-    #     bound["min"] = np.array([bound["min"][0] + shiftx, bound["min"][1] + shifty, bound["min"][2] + shiftz])
-    #     bound["max"] = np.array([bound["max"][0] + shiftx, bound["max"][1] + shifty, bound["max"][2] + shiftz])
+    #     bound["min"] = np.array([bound["min"][0] + shiftx, bound["min"][1] + shifty, bound["min"][2] + shiftz])*scale
+    #     bound["max"] = np.array([bound["max"][0] + shiftx, bound["max"][1] + shifty, bound["max"][2] + shiftz])*scale
 
     
     # # save it to tmp_bounds as a dictionnary of arrays 
