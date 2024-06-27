@@ -11,9 +11,6 @@
 
 import os
 import torch
-import tensorflow as tf
-from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten, Reshape, Layer
-from tensorflow.keras.models import Model
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -35,6 +32,10 @@ except ImportError:
 #################################################################################################
 ####################################### MY ADDITIONS ############################################
 import json
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 
 def load_bounds(file_path):
@@ -126,8 +127,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                print("Saving {} Gaussians".format(scene.gaussians.get_xyz.shape[0]))
+                print("\n[ITER {}] Saving {} Gaussians".format(iteration, scene.gaussians.get_xyz.shape[0]))
+                # print("Saving {} Gaussians".format(scene.gaussians.get_xyz.shape[0]))
                 scene.save(iteration)
 
             if (iteration % 1000 == 0):
@@ -155,8 +156,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-    #################################################################################################
-    ####################################### MY ADDITIONS ############################################
+#################################################################################################
+####################################### MY ADDITIONS ############################################
+
             # Every 500 iterations, we regroup the gaussians using the bounding boxes
             if iteration % 500 == 0 and iteration > 2000 and iteration < 10000:
                 print("\n[ITER {}] Regrouping Gaussians".format(iteration))
@@ -196,127 +198,121 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == 8502:
                 print("\n[ITER {}] Pausing the training for the user to check the results".format(iteration))
                 input("Press Enter to continue...")
+    
+    # After the training is done, we start training the SH coefficients
+    shs_fit(dataset, gaussians, pipe, scene)
 
-    #################################################################################################
-    #################################################################################################
+def preprocess_data(path):
+    '''
+    The associated transformation matrix can be found 
+    in the associated transformation.json file
+    '''
+    data = {}
+    data['train'] = {}
+    data['test'] = {}
+    for folder in os.listdir(path):
+        angle = float(folder)
+        folder_path = os.path.join(path, folder)
+        files = os.listdir(folder_path)
+        train_files = files[:int(0.8 * len(files))]
+        test_files = files[int(0.8 * len(files)):]
+        data['train'][angle] = [os.path.join(folder_path, file) for file in train_files]
+        data['test'][angle] = [os.path.join(folder_path, file) for file in test_files]
+    return data
 
+def custom_loss(opt, y_true, y_pred):
+    Ll1 = l1_loss(y_pred, y_true)
+    return (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(y_pred, y_true))
 
+def train_model(model, dataloader, optimizer, num_epochs=100):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for rotation_angles, ground_truth_images in dataloader:
+            optimizer.zero_grad()
+            outputs = model(rotation_angles, sh_coefficients)
+            loss = custom_loss(ground_truth_images, outputs)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f'Epoch {epoch + 1}, Loss: {running_loss / len(dataloader)}')
 
-#################################################################################################
-####################################### MY ADDITIONS ############################################
+def shs_fit(path, opt, pipe, scene, gaussians, bg, data):
+    data = preprocess_data(path)
+    N = gaussians.get_xyz.shape[0]
+    num_samples = ... # Number of different angles
+    batch_size = 32
+    width, height = 1000, 1000
+    train_model(model, data, opt)
 
-def shs_fit(dataset, opt, pipe, checkpoint, debug_from):
-    first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
-    gaussians.training_setup(opt)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+    rotation_angles = torch.randn(num_samples, 1) 
+    sh_coefficients = torch.randn(N, 16, 3)
+    ground_truth_images = torch.randn(num_samples, 3, width, height)
 
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    dataset = TensorDataset(rotation_angles, sh_coefficients, ground_truth_images)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    model = SHModel(num_samples)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    viewpoint_stack = None
-    ema_loss_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-    first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+    train_model(model, dataloader, optimizer)
 
-        iter_start.record()
+class DifferentiableRenderer(nn.Module):
+    def __init__(self, gaussians, viewpoint_cam, pipe, bg):
+        super(DifferentiableRenderer, self).__init__()
+        self.gaussians = gaussians
+        self.viewpoint_cam = viewpoint_cam
+        self.pipe = pipe
+        self.bg = bg
 
-        gaussians.update_learning_rate(iteration)
+    def forward(self, sh_coeff):
+        self.gaussians.set_features_rest(sh_coeff)
+        rendered_image = self.renderer(self.viewpoint_cam, self.gaussians, self.pipe, self.bg)
+        return rendered_image
 
-
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
-        # Render
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
-
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
-
+    def renderer(self, viewpoint_cam, gaussians, pipe, bg):
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        loss.backward()
-
-
-
-# def template():
-#     class DifferentiableRenderer(Layer):
-#         def call(self, sh_coeff):
-#             rendered_image = ...  
-#             return rendered_image
-
-#     # Define the input layers
-#     rotation_angle_input = Input(shape=(1,), name='rotation_angle')  # Modify shape if more angles are used
-#     sh_coeff_input = Input(shape=(N, 16, 3), name='sh_coefficients')
-
-#     # Flatten the SH coefficients input
-#     sh_coeff_flat = Flatten()(sh_coeff_input)
-
-#     # Process rotation angle input
-#     rotation_dense = Dense(64, activation='relu')(rotation_angle_input)
-#     rotation_dense = Dense(64, activation='relu')(rotation_dense)
-
-#     # Process SH coefficients input
-#     sh_dense = Dense(512, activation='relu')(sh_coeff_flat)
-#     sh_dense = Dense(512, activation='relu')(sh_dense)
-
-#     # Concatenate processed rotation angle and SH coefficients
-#     concat = Concatenate()([rotation_dense, sh_dense])
-
-#     # Further processing after concatenation
-#     hidden = Dense(512, activation='relu')(concat)
-#     hidden = Dense(512, activation='relu')(hidden)
-
-#     # Define the output layer (reshaped to match SH coefficients dimensions)
-#     adjusted_sh_coeff_flat = Dense(N * 16 * 3)(hidden)
-#     adjusted_sh_coeff = Reshape((N, 16, 3))(adjusted_sh_coeff_flat)
-
-#     # Apply the differentiable renderer to the adjusted SH coefficients
-#     rendered_image = DifferentiableRenderer()(adjusted_sh_coeff)
-
-#     # Build the model
-#     model = Model(inputs=[rotation_angle_input, sh_coeff_input], outputs=rendered_image)
-
-#     # Compile the model with the desired loss functions
-#     def custom_loss(y_true, y_pred):
-#         l1_loss = tf.reduce_mean(tf.abs(y_true - y_pred))
-#         ssim_loss = 1 - tf.reduce_mean(tf.image.ssim(y_true, y_pred, max_val=1.0))
-#         psnr_loss = -tf.reduce_mean(tf.image.psnr(y_true, y_pred, max_val=1.0))
-#         return l1_loss + ssim_loss + psnr_loss
-
-#     model.compile(optimizer='adam', loss=custom_loss)
-
-#     # Train the model
-#     model.fit([rotation_angles, sh_coefficients], ground_truth_images, epochs=100, batch_size=32, validation_split=0.2)
+        return image
+# Define the neural network model
+class SHModel(nn.Module):
+    def __init__(self, N):
+        super(SHModel, self).__init__()
+        self.N = N
+        
+        self.rotation_dense1 = nn.Linear(1, 64)
+        self.rotation_dense2 = nn.Linear(64, 64)
+        
+        self.sh_dense1 = nn.Linear(N * 16 * 3, 512)
+        self.sh_dense2 = nn.Linear(512, 512)
+        
+        self.concat_dense1 = nn.Linear(512 + 64, 512)
+        self.concat_dense2 = nn.Linear(512, 512)
+        
+        self.output_dense = nn.Linear(512, N * 16 * 3)
+        
+        self.renderer = DifferentiableRenderer()
+    
+    def forward(self, rotation_angle, sh_coeff):
+        sh_coeff_flat = sh_coeff.view(sh_coeff.size(0), -1)
+        
+        x1 = F.relu(self.rotation_dense1(rotation_angle))
+        x1 = F.relu(self.rotation_dense2(x1))
+        
+        x2 = F.relu(self.sh_dense1(sh_coeff_flat))
+        x2 = F.relu(self.sh_dense2(x2))
+        
+        x = torch.cat((x1, x2), dim=1)
+        
+        x = F.relu(self.concat_dense1(x))
+        x = F.relu(self.concat_dense2(x))
+        
+        adjusted_sh_coeff_flat = self.output_dense(x)
+        adjusted_sh_coeff = adjusted_sh_coeff_flat.view(-1, self.N, 16, 3)
+        
+        rendered_image = self.renderer(adjusted_sh_coeff)
+        
+        return rendered_image
 
 #################################################################################################
 #################################################################################################

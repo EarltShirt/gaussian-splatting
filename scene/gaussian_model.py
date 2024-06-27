@@ -169,6 +169,9 @@ class GaussianModel:
     def set_parts(self, parts):
         self.parts = parts
 
+    def set_features_rest(self, features_rest):
+        self._features_rest = features_rest
+
     def get_pivots(self):
         return self.pivots
     
