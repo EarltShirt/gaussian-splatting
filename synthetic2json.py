@@ -6,9 +6,9 @@ import math
 import json
 import random
 
-N_images = 120
-test_indices = random.sample(range(1,N_images), 20)
-val_indices = random.sample(list(set(range(1,N_images)) - set(test_indices)), 10)
+# N_images = 130
+# test_indices = random.sample(range(1,N_images), 30)
+# val_indices = random.sample(list(set(range(1,N_images)) - set(test_indices)), 10)
 
 
 def unity2dnerf_coordinates(extrinsic_matrix):
@@ -47,6 +47,8 @@ def get_data(input_path):
     for file in os.listdir(input_path):
         filename = os.fsdecode(file)
         if filename.endswith(".txt"):
+            # check that the files are processed in the right order
+            # print(f"Processing file: {filename}")
             matrix1, intrinsic, array = load_data(os.path.join(input_path, filename))
             extrinsic_matrices.append(matrix1)
             intrinsics_matrices.append(intrinsic)
@@ -77,12 +79,18 @@ def rewrite_data(images, output_path, matrix_path):
     val_frames = []
 
     N_images = len(extrinsic_matrices)
+    print(f"Number of images: {N_images}")
+    # print(f"Test indices: {test_indices}")
+    # print(f"Val indices: {val_indices}")
 
     
     train_iterator = 1
     test_iterator = 1
     val_iterator = 1
 
+    test_indices = random.sample(range(1,N_images), 20)
+    val_indices = random.sample(list(set(range(1,N_images)) - set(test_indices)), 5)
+    print(f"Test indices: {test_indices}")
     for i in range(N_images):
         image_old_name = os.path.join(images, f"image_{(i+1):04d}.png")
 
@@ -147,20 +155,6 @@ def generate_json(images, output_path, matrix_path):
     test_frames = [{**frame_data, "transform_matrix": frame_data["transform_matrix"].tolist()} for frame_data in test_frames]
     val_frames = [{**frame_data, "transform_matrix": frame_data["transform_matrix"].tolist()} for frame_data in val_frames]
 
-
-    # train_data = {
-    #     "camera_angle_x": float(camera_angles_train[0]), 
-    #     "frames": train_frames
-    # }
-    # test_data = {
-    #     "camera_angle_x": float(camera_angles_test[0]), 
-    #     "frames": test_frames
-    # }
-    # val_data = {
-    #     "camera_angle_x": float(camera_angles_val[0]), 
-    #     "frames": val_frames
-    # }
-
     train_data = {
         "camera_angle_x": 0.6911112070083618, 
         "frames": train_frames
@@ -174,7 +168,6 @@ def generate_json(images, output_path, matrix_path):
         "frames": val_frames
     }
 
-    # with open(os.path.join(output_path, "transforms_train.json"), 'w') as f:
     with open(os.path.join(output_path, "transforms_train.json"), 'w') as f:
         json.dump(train_data, f, indent=4)
     with open(os.path.join(output_path, "transforms_test.json"), 'w') as f:
@@ -195,7 +188,7 @@ if __name__ == "__main__":
     for folder in os.listdir(path):
         # check if the folder is a directory
         if os.path.isdir(os.path.join(path, folder)):
-            print(f'Processing folder: {folder}')
+            print(f'\nProcessing folder: {folder}')
             # check if the associated output folder exists
             if not os.path.exists(os.path.join(output_path, folder)):
                 os.makedirs(os.path.join(output_path, folder))

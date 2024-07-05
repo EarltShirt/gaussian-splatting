@@ -186,7 +186,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
     cam_infos = []
 
-    with open(os.path.join(path, transformsfile)) as json_file:
+    with open(os.path.join(path, transformsfile),'r') as json_file:
         contents = json.load(json_file)
         fovx = contents["camera_angle_x"]
 
@@ -266,19 +266,6 @@ def segment_from_ply(bounds, num_pts, path, gaussians):
     for bound in bounds.values():
         bound["min"] = np.array(bound["min"])
         bound["max"] = np.array(bound["max"])
-    
-    # temporaty fix for the bounds of the part4 (the 3DGS representation is not accurate for this part, elongates it a bit)
-    # for idx, bound in bounds.items():
-        # if 'part1' in idx:
-        #     bound["min"] -= np.array([0.0, 0.06, 0.00])
-        # if 'part2' in idx:
-        #     bound["min"] -= np.array([0.0, 0.02, 0.02])
-        #     bound["max"] += np.array([0.01, 0.0, 0.0])
-        # if 'part3' in idx:
-        #     bound["min"] += np.array([-0.02, 0.0, -0.02])
-        #     bound["max"] += np.array([0.0, 0.04, 0.0])
-        # if 'part4' in idx:
-        #     bound["max"] += np.array([0.05, 0.05, 0.05])
 
     # epsilon = np.ones(3) * 10e-4
 
@@ -293,9 +280,22 @@ def segment_from_ply(bounds, num_pts, path, gaussians):
     #     tmp = bound["max"].copy()[0]
     #     bound["max"][0] = bound["max"][2]
     #     bound["max"][2] = tmp
+ 
+    # temporaty fix for the bounds of the part4 (the 3DGS representation is not accurate for this part, elongates it a bit)
+    # for idx, bound in bounds.items():
+    #     if 'part1' in idx:
+    #         bound["min"] -= np.array([0.0, 0.06, 0.00])
+    #     if 'part2' in idx:
+    #         bound["min"] -= np.array([0.0, 0.02, 0.02])
+    #     if 'part3' in idx:
+    #         bound["min"] += np.array([-0.02, 0.0, -0.02])
+    #         bound["max"] += np.array([0.0, 0.07, 0.0])
+    #     if 'part4' in idx:
+    #         bound["max"] += np.array([0.05, 0.09, 0.05])
 
-    # shiftx = 0.05
-    # shifty = -0.05
+
+    # shiftx = 0.0
+    # shifty = -0.16
     # shiftz = 0.0
     # scale = 1.0
 
@@ -426,12 +426,23 @@ def readNerfSyntheticInfo(path, white_background, eval, gaussians, extension=".p
 
 #################################################################################################
 ####################################### MY ADDITIONS ############################################
-        bounds_path = os.path.join(path, "bounding_boxes.json")
-        bounds = load_bounds(bounds_path)
+        # bounds_path = os.path.join(path, "bounding_boxes.json")
+        # bounds = load_bounds(bounds_path)
 
-        pcd = generate_pcd(bounds, num_pts, path, gaussians)
-    
-    
+        # pcd = generate_pcd(bounds, num_pts, path, gaussians)
+        
+        
+        # Bounding_cube_size = 2.6
+        Bounding_cube_size = 10.0
+        
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * Bounding_cube_size - (Bounding_cube_size / 2.0)
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+
     if os.path.exists(ply_path):
         print(f'Point cloud found at {ply_path}')
         bounds_path = os.path.join(path, "bounding_boxes.json")
@@ -441,16 +452,6 @@ def readNerfSyntheticInfo(path, white_background, eval, gaussians, extension=".p
         pcd = segment_from_ply(bounds, num_points, path, gaussians)
 #################################################################################################
 #################################################################################################
-
-        # # Bounding_cube_size = 2.6
-        # Bounding_cube_size = 20.0
-        
-        # # We create random points inside the bounds of the synthetic Blender scenes
-        # xyz = np.random.random((num_pts, 3)) * Bounding_cube_size - (Bounding_cube_size / 2.0)
-        # shs = np.random.random((num_pts, 3)) / 255.0
-        # pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
-
-        # storePly(ply_path, xyz, SH2RGB(shs) * 255)
 
     # try:
     #     pcd = fetchPly(ply_path)

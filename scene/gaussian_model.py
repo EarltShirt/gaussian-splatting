@@ -104,6 +104,11 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self._groups,
+            self.bounds,
+            self.parts,
+            self.x_pivots,
+            self.z_pivots
         )
     
     def restore(self, model_args, training_args):
@@ -118,7 +123,12 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale,
+        self._groups,
+        self.bounds,
+        self.parts,
+        self.x_pivots,
+        self.z_pivots) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
@@ -148,7 +158,17 @@ class GaussianModel:
     
 #################################################################################################
 ####################################### MY ADDITIONS ############################################
-    def set_groups(self, np_groups):
+    @property
+    def get_rots(self):
+        return self._rotation
+    
+    def set_rots(self, rots):
+        self._rotation = rots
+
+    def set_xyz(self, xyz):
+        self._xyz = xyz
+    
+    def set_groups(self, np_groups : np.ndarray):
         self._groups = torch.tensor(np.asarray(np_groups)).float().cuda()
 
     def set_group(self, gaussian_idx, group_idx):
@@ -168,6 +188,13 @@ class GaussianModel:
 
     def set_parts(self, parts):
         self.parts = parts
+    
+    def get_scaling_no_activation(self):
+        return self._scaling
+    
+    @property
+    def get_features_rest(self):
+        return self._features_rest
 
     def set_features_rest(self, features_rest):
         self._features_rest = features_rest
@@ -289,6 +316,10 @@ class GaussianModel:
     # method found inn the issues of the inria/3DGS github repo
     # def transform_shs(self, shs_feat, rotation_matrix):
     def transform_shs(self, shs_feat, theta, axis):
+        '''
+        One thing to note is that this implementation assumes shs_feat to be in 
+        the shape of (n, 15, 3), not (n, 16, 3), excluding base color.
+        '''
         # rotate shs
         # P = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]]) # switch axes: yzx -> xyz
         # P = np.array([[0, 0, 1], [-1, 0, 0], [0, 1, 0]])
@@ -352,18 +383,6 @@ class GaussianModel:
         repeated_pivot = pivot_point.repeat(N, 1).float()
         self._xyz[group_mask] = torch.add(bmm, repeated_pivot).float()
 
-        
-        test = self._rotation[100:110].clone()
-        r = build_rotation(test).double()
-        rot_angles = o3._rotation.matrix_to_quaternion(r.cpu())
-        print(f'\n\nQuaternions before using o3 :\n{test.double().cpu().numpy()}')
-        print(f'Quaternions after using o3  :\n{rot_angles.double().cpu().numpy()}')
-        print(f'Difference between the two methods : \n{(rot_angles - test.cpu()).cpu().numpy()}')
-        print(f'Norm of the difference : {torch.norm(rot_angles - test.cpu())}')
-        print(f'Difference between the two methods with 3/4: \n{(rot_angles*3/4 - test.cpu()).cpu().numpy()}')
-        print(f'Norm of the difference with 3/4: {torch.norm(rot_angles*3/4 - test.cpu())}')
-        
-        
         # same but for the internal rotation of the gaussians
         rotations = rotation.repeat(N, 1, 1).double()
         rotated_rotations = build_rotation(self._rotation[group_mask]).double()
@@ -371,12 +390,67 @@ class GaussianModel:
         angles = o3._rotation.matrix_to_quaternion(rotated_rotations.cpu()).float()
         self._rotation[group_mask] = angles.to(device="cuda")
         
-        # Now we will rotate the features_dc and features_rest
-        # print(f'shape of features_rest : {self._features_rest.shape}')
-        # theta = -np.pi / 4
-        # ROT = self.create_rotation_matrix(theta, 'z')
-        # self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], ROT)
         self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], theta, axis)
+
+    def rotate_gaussians_MLP(self, group_idx : int, theta : float, axis : str, features_rest):
+        '''
+        Method used in the MLP, the features_rest are completely modified by the MLP
+        and therefore we do not neeed to rotate the spherical harmonics. 
+        Moreover, all of the features dc need to be overwritten by the MLP (e.g. to
+        modify specular spots, shadings, etc.)
+        '''
+        self.regroup_and_prune()
+        self.define_pivots()
+        pivot_point = torch.tensor(self.get_x_pivot(group_idx), dtype=torch.float, device="cuda")
+        group_mask = self._groups >= group_idx
+        N = int(group_mask.sum().item())
+        rotation = self.create_rotation_matrix(theta, axis)
+        rotations = rotation.repeat(N, 1, 1).float()
+        bmm = torch.bmm(rotations, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1)
+        repeated_pivot = pivot_point.repeat(N, 1).float()
+        self._xyz[group_mask] = torch.add(bmm, repeated_pivot).float()
+
+        # same but for the internal rotation of the gaussians
+        rotations = rotation.repeat(N, 1, 1).double()
+        rotated_rotations = build_rotation(self._rotation[group_mask]).double()
+        rotated_rotations = torch.bmm(rotations, rotated_rotations)
+        angles = o3._rotation.matrix_to_quaternion(rotated_rotations.cpu()).float()
+        self._rotation[group_mask] = angles.to(device="cuda")
+
+        self._features_rest = features_rest
+
+    def external_rotation(self, group_idx : int, theta : float, axis : str):
+        '''
+        This will perform the same operation as rotate_gaussians, but instead of 
+        rotating the gaussians in place, we will return a (xyz, rotation, features) tuple
+        '''
+        self.regroup_and_prune()
+        self.define_pivots()
+        pivot_point = torch.tensor(self.get_x_pivot(group_idx), dtype=torch.float, device="cuda")
+        group_mask = self._groups >= group_idx
+        N = int(group_mask.sum().item())
+        rotation = self.create_rotation_matrix(theta, axis)
+        rotations = rotation.repeat(N, 1, 1).float()
+        bmm = torch.bmm(rotations, (self._xyz[group_mask] - pivot_point).unsqueeze(-1)).squeeze(-1)
+        repeated_pivot = pivot_point.repeat(N, 1).float()
+        xyz = self._xyz.clone()
+        xyz[group_mask] = torch.add(bmm, repeated_pivot).float()
+
+        # same but for the internal rotation of the gaussians
+        rotations = rotation.repeat(N, 1, 1).double()
+        rotated_rotations = build_rotation(self._rotation[group_mask]).double()
+        rotated_rotations = torch.bmm(rotations, rotated_rotations)
+        angles = o3._rotation.matrix_to_quaternion(rotated_rotations.cpu()).float()
+        M_rotations = self._rotation.clone()
+        M_rotations[group_mask] = angles.to(device="cuda")
+
+        # Now we will rotate the features_dc and features_rest
+        features_dc = self._features_dc.clone()
+        features_rest = self._features_rest.clone()
+        features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], theta, axis)
+        features = torch.cat((features_dc, features_rest), dim=1)
+
+        return xyz, M_rotations, features
 
     def prune_points_groups(self, mask):
         valid_points_mask = ~mask
