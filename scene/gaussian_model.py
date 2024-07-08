@@ -88,6 +88,7 @@ class GaussianModel:
         self.parts = None
         self.x_pivots = None
         self.z_pivots = None
+        self._subgroups = torch.empty(0)
 
 
     def capture(self):
@@ -105,6 +106,7 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
             self._groups,
+            self._subgroups,
             self.bounds,
             self.parts,
             self.x_pivots,
@@ -125,6 +127,7 @@ class GaussianModel:
         opt_dict, 
         self.spatial_lr_scale,
         self._groups,
+        self._subgroups,
         self.bounds,
         self.parts,
         self.x_pivots,
@@ -182,6 +185,9 @@ class GaussianModel:
     
     def get_groups(self):
         return self._groups
+    
+    def get_subgroups(self):
+        return self._subgroups
 
     def set_bounds(self, bounds):
         self.bounds = bounds
@@ -201,6 +207,10 @@ class GaussianModel:
 
     def get_pivots(self):
         return self.pivots
+    
+    def set_features(self, feats):
+        self._features_dc = feats[:, :, 0:1]
+        self._features_rest = feats[:, :, 1:]
     
     def get_x_pivot(self, part_idx):
         switcher = {
@@ -392,7 +402,7 @@ class GaussianModel:
         
         self._features_rest[group_mask] = self.transform_shs(self.get_features[group_mask][:,:15,:], theta, axis)
 
-    def rotate_gaussians_MLP(self, group_idx : int, theta : float, axis : str, features_rest):
+    def rotate_gaussians_MLP(self, group_idx : int, theta : float, axis : str, features):
         '''
         Method used in the MLP, the features_rest are completely modified by the MLP
         and therefore we do not neeed to rotate the spherical harmonics. 
@@ -417,7 +427,11 @@ class GaussianModel:
         angles = o3._rotation.matrix_to_quaternion(rotated_rotations.cpu()).float()
         self._rotation[group_mask] = angles.to(device="cuda")
 
-        self._features_rest = features_rest
+        if features.shape[1] == 15:
+            self._features_rest = features
+        elif features.shape[1] == 16:
+            self._features_dc = features[:, 0:1, :]
+            self._features_rest = features[:, 1:, :]
 
     def external_rotation(self, group_idx : int, theta : float, axis : str):
         '''
@@ -616,6 +630,58 @@ class GaussianModel:
             group_mask = torch.logical_and(group_mask, torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"])).to(device="cuda"), dim=1))
             groups[group_mask] = idx
         self._groups = groups
+    
+    def fill_subgroups(self):
+        '''
+        Fills the subgroups tensor with the corresponding subgroup index
+        '''
+        subgroups = torch.zeros((self._xyz.shape[0], ), device="cuda")
+        xyz = self._xyz.detach().cpu().numpy()
+
+        print(f'Available bounds : {self.bounds}')
+        epsilon_min = np.zeros(3)    
+        epsilon_max = np.zeros(3)    
+        for group_idx, bound in self.bounds.items():
+            print(f'Group index : {group_idx}')
+            if 'part1_base' in group_idx:
+                idx = 1
+            elif 'part1_angle_l' in group_idx:
+                idx = 2
+                epsilon_min = np.array([0.0, 0.04, 0.0])
+                epsilon_max = np.array([0.0, 0.02, 0.0])
+            elif 'part2_angle_l' in group_idx:
+                idx = 3
+            elif 'part2_tube' in group_idx:
+                idx = 4
+                epsilon_min = np.array([0.0, 0.02, 0.0])
+            elif 'part2_angle_h' in group_idx:
+                idx = 5
+            elif 'part3_angle_l' in group_idx:
+                idx = 6
+                epsilon_max = np.array([0.0, -0.04, 0.0])
+            elif 'part3_tube' in group_idx:
+                idx = 7
+                epsilon_min = np.array([0.0, 0.01, 0.0])                
+                epsilon_max = np.array([0.0, -0.04, 0.0])
+            elif 'part3_angle_h' in group_idx:
+                idx = 8
+                epsilon_min = np.array([0.0, -0.05, 0.0])
+            elif 'part4_angle_l' in group_idx:
+                idx = 9
+                epsilon_max = np.array([0.0, -0.04, 0.0])
+            elif 'part4_angle_h' in group_idx:
+                idx = 10
+                epsilon_min = np.array([0.0, -0.02, 0.0])
+            elif 'part4_bout' in group_idx:
+                idx = 11
+            else :
+                idx = 0
+            group_mask = torch.where(
+                torch.all(self._xyz >= torch.from_numpy(np.array(bound["min"]) + epsilon_min).to(device="cuda"), dim=1), True, False
+            )
+            group_mask = torch.logical_and(group_mask, torch.all(self._xyz <= torch.from_numpy(np.array(bound["max"]) + epsilon_max).to(device="cuda"), dim=1))
+            subgroups[group_mask] = idx
+        self._subgroups = subgroups
 
     def regroup_and_prune(self):
         '''
@@ -630,37 +696,19 @@ class GaussianModel:
     def save_post_segmented_ply(self, path):
         seg_xyz = self._xyz.detach().cpu().numpy()
 
-        bounds = self.bounds
-        parts = self.parts
-        print(f'Parts : {parts}')
+        subgroups = self._subgroups.detach().cpu().numpy()
 
-        colors_lst = np.array([[255, 0, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255]])
+        colors_lst = np.array([[255, 0, 255], [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 255, 255], [128, 0, 128], [128, 128, 0], [0, 128, 128], [128, 128, 128], [0, 0, 128], [0, 128, 0], [128, 0, 0], [0, 0, 0], [255, 255, 255]])
         seg_colors = np.zeros((seg_xyz.shape[0], 3))
-        group_idx = 0
-        epsilon = np.ones(3) * 0.001
-        for part in parts:
-            for subpart in part:
-                j = 0
-                min, max = np.array(bounds[subpart]["min"]), np.array(bounds[subpart]["max"])
-                # print(f'\nGroup {group_idx} - Part : {subpart} - Min : {min} - Max : {max}')
-                for pid, point in enumerate(seg_xyz):
-                    if np.all(point >= (min-epsilon)) and np.all(point <= (max+epsilon)):
-                        seg_colors[pid] = colors_lst[group_idx]
-                        j += 1
-                # print(f"Subpart {subpart} has {j} points")
-            group_idx += 1
+        i = 0
+        for subgroup_idx in range(1, 12):
+            subgroup_mask = subgroups == subgroup_idx
+            color = colors_lst[i]
+            seg_colors[subgroup_mask] = color
+            i += 1
+            print(f'Subgroup {subgroup_idx} has {subgroup_mask.sum()} points')
 
         storePly(path, seg_xyz, seg_colors)
-        
-        # bound_color = np.array([255, 255, 255])
-
-        # for key, bound in bounds.items():
-        #     min = bound["min"]
-        #     max = bound["max"]
-        #     bound_xyz = np.array([[min[0], min[1], min[2]], [max[0], min[1], min[2]], [max[0], max[1], min[2]], [min[0], max[1], min[2]], [min[0], min[1], max[2]], [max[0], min[1], max[2]], [max[0], max[1], max[2]], [min[0], max[1], max[2]]])
-        #     bound_colors = np.full((bound_xyz.shape[0], 3), bound_color)
-        #     bound_path = path.replace(".ply", f"_{key}.ply")
-        #     storePly(bound_path, bound_xyz, bound_colors)
     
     def save_segmented_ply(self, path):
         xyz = self._xyz.detach().cpu().numpy()

@@ -180,13 +180,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             
             if iteration == 1000:
                 print("\n[ITER {}] Group Visualization".format(iteration))
-                # scene.gaussians.regroup_and_prune()
-                segmented_ply_path = os.path.join(scene.model_path, "segmented.ply")    
-                gaussians.save_segmented_ply(segmented_ply_path)
-
-                # gaussians.regroup_and_prune()
-                post_segmented_ply_path = os.path.join(scene.model_path, "post_segmented.ply")
+                gaussians.regroup_and_prune()
+                gaussians.fill_subgroups()
+                post_segmented_ply_path = os.path.join(scene.model_path, "subgroups.ply")
                 gaussians.save_post_segmented_ply(post_segmented_ply_path)
+                segmented_ply_path = os.path.join(scene.model_path, "groups.ply")    
+                gaussians.save_segmented_ply(segmented_ply_path)
 
                 print("\nStoring the pre-segmented point cloud at {}".format(segmented_ply_path))
                 print("\nStoring the post-segmented point cloud at {}".format(post_segmented_ply_path))
@@ -210,9 +209,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # if iteration == 25502:
             #     print("\n[ITER {}] Pausing the training for the user to check the results".format(iteration))
             #     input("Press Enter to continue...")
+    gaussians.regroup_and_prune()
+    gaussians.fill_subgroups()
     print("\n[FINISHED] Saving Final Checkpoint")
     torch.save((gaussians.capture(), iteration), scene.model_path + "/final_chkpnt.pth") 
-    gaussians.regroup_and_prune()
     return dataset, gaussians, scene, pipe, background
 
 def shs_fit(args, dataset, gaussians, scene, pipe, background):
@@ -234,11 +234,23 @@ def shs_fit(args, dataset, gaussians, scene, pipe, background):
     
     print(f'The Fitting Process May Commence')
     print(f'\nThe retrieved groups are {gaussians.get_groups().cpu().numpy()}')
-    # model = SHMLP(gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, background, chkpt_path, gaussians.max_sh_degree, op.extract(args), gaussians.get_features_rest)
-    model = SHsplitMLP(gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, background, chkpt_path, gaussians.max_sh_degree, op.extract(args), gaussians.get_features_rest, gaussians.get_groups(), gaussians)
+    model = SubGroupMLP( gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, 
+                        background, chkpt_path, gaussians.max_sh_degree, op.extract(args), 
+                        gaussians.get_features, gaussians.get_subgroups() )
+
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+
+    size_all_mb = (param_size + buffer_size) / 1024**2
+    print('model size: {:.3f}MB'.format(size_all_mb))
+    
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     TrainLoader = DataLoader(TrainSet, batch_size=1, shuffle=True)
-    # train_model(model, TrainLoader, optimizer)
+    train_model(model, TrainLoader, optimizer)
 
 def retrieve_data(path):
     '''
@@ -309,7 +321,7 @@ def train_model(model, dataloader, optimizer, lambda_dssim = 0.2, num_epochs=100
             it += 1
             R, T, angle, image_name = sample
             optimizer.zero_grad()
-            output = model(angle, image_name)
+            output = model(angle.double(), image_name)
             loss = custom_loss(lambda_dssim, image, output)
             loss.backward()
             optimizer.step()
@@ -412,8 +424,8 @@ class DifferentiableRenderer(nn.Module):
         self.pipe = pipe
         self.bg = bg
 
-    def forward(self, features_rest, viewpoint_cam, angle):
-        self.gaussians.rotate_gaussians_MLP(3, angle, 'x', features_rest)
+    def forward(self, features, viewpoint_cam, angle):
+        self.gaussians.rotate_gaussians_MLP(3, angle, 'x', features)
         rendered_image = self.renderer(viewpoint_cam)
         self.gaussins.set_features_rest(self.features_rest)
         self.gaussians.set_xyz(self.xyz)
@@ -492,7 +504,7 @@ class SHMLP(nn.Module):
         return rendered_image
 
 class SHsplitMLP(nn.Module):
-    def __init__(self, N, viewpoint_stack, pipe, bg, chkpt, sh_degree, opt, sh_coeff, groups, gaussians):
+    def __init__(self, N, viewpoint_stack, pipe, bg, chkpt, sh_degree, opt, sh_coeff, groups):
         super(SHsplitMLP, self).__init__()
         '''
         Same MLP as SHMLP but with the sh_coeff split into 4 tensors of size (N_i, 15, 3)
@@ -511,6 +523,8 @@ class SHsplitMLP(nn.Module):
         if chkpt:
             (model_params, first_iter) = torch.load(chkpt)
             self.gaussians.restore(model_params, opt)
+
+        print(f'The minimum group index is {groups.min()} and the maximum group index is {groups.max()}')
         self.xyz = self.gaussians.get_xyz
         self.rotations = self.gaussians.get_rots
         self.features_rest = self.gaussians.get_features_rest
@@ -519,10 +533,10 @@ class SHsplitMLP(nn.Module):
 
         self.sh_coeff = sh_coeff.view(self.N, 15, 3)
 
-        self.group1_mask = groups == 0
-        self.group2_mask = groups == 1
-        self.group3_mask = groups == 2
-        self.group4_mask = groups == 3
+        self.group1_mask = groups == 1
+        self.group2_mask = groups == 2
+        self.group3_mask = groups == 3
+        self.group4_mask = groups == 4
 
         print(f'Mask for group 1 : {self.group1_mask}')
 
@@ -536,80 +550,47 @@ class SHsplitMLP(nn.Module):
         print(f'Group 3 contains {self.N_3} gaussians')
         print(f'Group 4 contains {self.N_4} gaussians')
 
-        self.sh_group1 = self.sh_coeff[self.group1_mask]
-        self.sh_group2 = self.sh_coeff[self.group2_mask]
-        self.sh_group3 = self.sh_coeff[self.group3_mask]
-        self.sh_group4 = self.sh_coeff[self.group4_mask]
+        self.sh_group1 = self.sh_coeff[self.group1_mask].double()
+        self.sh_group2 = self.sh_coeff[self.group2_mask].double()
+        self.sh_group3 = self.sh_coeff[self.group3_mask].double()
+        self.sh_group4 = self.sh_coeff[self.group4_mask].double()
 
-        self.xyz_group1 = self.xyz[self.group1_mask]
-        self.xyz_group2 = self.xyz[self.group2_mask]
-        self.xyz_group3 = self.xyz[self.group3_mask]
-        self.xyz_group4 = self.xyz[self.group4_mask]
+        self.xyz_group1 = self.xyz[self.group1_mask].double()
+        self.xyz_group2 = self.xyz[self.group2_mask].double()
+        self.xyz_group3 = self.xyz[self.group3_mask].double()
+        self.xyz_group4 = self.xyz[self.group4_mask].double()
 
-        A = 2048
-        B = 2048
-        C = 2048
-        D = 2048
-        E = 2048
-        F = 2048
-        G = 2048
-        H = 2048
-        I = 2048
-        J = 2048
-        K = 2048
-        L = 2048
-        M = 2048
-        O = 2048
-        P = 2048
-        Q = 2048
-        R = 2048
-        S = 2048
-        T = 2048
-        U = 2048
+        A = 192
+        B = 192
 
-        self.rotation_dense = nn.Linear(1, 32) # (1) -> (32)
+        self.rotation_dense = nn.Linear(1, 32) 
 
-        # Extract features from the spherical harmonics of each group
-        self.sh_dense1_gr1 = nn.Linear(self.N_1 * 15 * 3, A) # (N_1 * 15 * 3) -> A
-        self.sh_dense1_gr2 = nn.Linear(self.N_2 * 15 * 3, B) # (N_2 * 15 * 3) -> B
-        self.sh_dense1_gr3 = nn.Linear(self.N_3 * 15 * 3, C) # (N_3 * 15 * 3) -> C
-        self.sh_dense1_gr4 = nn.Linear(self.N_4 * 15 * 3, D) # (N_4 * 15 * 3) -> D
+        self.sh_dense1 = nn.Linear(self.N_1 * 16 * 3, A) # A
+        self.sh_dense2 = nn.Linear(self.N_2 * 16 * 3, A) # B
+        self.sh_dense3 = nn.Linear(self.N_3 * 16 * 3, A) # C
+        self.sh_dense4 = nn.Linear(self.N_4 * 16 * 3, A) # D
 
-        # Extract features from the xyz coordinates of each group
-        self.xyz_dense1_gr1 = nn.Linear(self.N_1 * 3, E) # (N_1 * 3) -> E
-        self.xyz_dense1_gr2 = nn.Linear(self.N_2 * 3, F) # (N_2 * 3) -> F
-        self.xyz_dense1_gr3 = nn.Linear(self.N_3 * 3, G) # (N_3 * 3) -> G
-        self.xyz_dense1_gr4 = nn.Linear(self.N_4 * 3, H) # (N_4 * 3) -> H
+        self.xyz_dense1 = nn.Linear(self.N_1 * 3, B) # E
+        self.xyz_dense2 = nn.Linear(self.N_2 * 3, B) # F
+        self.xyz_dense3 = nn.Linear(self.N_3 * 3, B) # G
+        self.xyz_dense4 = nn.Linear(self.N_4 * 3, B) # H 
         
-        # Concatenate the features extracted from the spherical harmonics and the xyz coordinates
-        self.sh_xyz_dense_gr12 = nn.Linear(32 + A + F, I) # (32 + A + F) -> I
-        self.sh_xyz_dense_gr13 = nn.Linear(32 + A + G, J) # (32 + A + G) -> J
-        self.sh_xyz_dense_gr14 = nn.Linear(32 + A + H, K) # (32 + A + H) -> K
-        self.sh_xyz_dense_gr21 = nn.Linear(32 + B + E, L) 
-        self.sh_xyz_dense_gr23 = nn.Linear(32 + B + G, M) # (32 + B + F) -> L
-        self.sh_xyz_dense_gr24 = nn.Linear(32 + B + H, O) # (32 + B + H) -> M
-        self.sh_xyz_dense_gr31 = nn.Linear(32 + C + E, P)
-        self.sh_xyz_dense_gr32 = nn.Linear(32 + C + F, Q)
-        self.sh_xyz_dense_gr34 = nn.Linear(32 + C + G, R) # (32 + C + G) -> O
-        self.sh_xyz_dense_gr41 = nn.Linear(32 + D + E, S)
-        self.sh_xyz_dense_gr42 = nn.Linear(32 + D + F, T)
-        self.sh_xyz_dense_gr43 = nn.Linear(32 + D + G, U)
-
-        self.output_gr1 = nn.Linear(I + J + K , self.N_1 * 15 * 3)
-        self.output_gr2 = nn.Linear(L + M + O , self.N_2 * 15 * 3)
-        self.output_gr3 = nn.Linear(P + Q , self.N_3 * 15 * 3)
-        self.output_gr4 = nn.Linear(S + T + U , self.N_4 * 15 * 3)
+        self.output_dense1 = nn.Linear(A + 4 * B + 32, self.N_1 * 16 * 3) # A + E + F + G + H -> I
+        self.output_dense2 = nn.Linear(A + 4 * B + 32, self.N_2 * 16 * 3) # B + E + F + G + H -> I
+        self.output_dense3 = nn.Linear(A + 4 * B + 32, self.N_3 * 16 * 3) # C + E + F + G + H -> I
+        self.output_dense4 = nn.Linear(A + 4 * B + 32, self.N_4 * 16 * 3) # D + E + F + G + H -> I
 
         self.renderer = DifferentiableRenderer(chkpt, sh_degree, pipe, bg, opt)
         print('SHsplitMLP Model initialized')
         print(self)
         print(f'Model size : {torch.cuda.memory_allocated()/1_000_000_000} Go')
+        print(f'Maximum memory allocated : {torch.cuda.max_memory_allocated()/1_000_000_000} Go')
 
     def forward(self, rotation_angle, image_name):
         '''
         Input:
             - rotation_angle: the angle of rotation of the viewpoint (in radians)
-            - sh_coeff: the spherical harmonics coefficients of size (N, 15, 3) ~ features_rest
+            - sh_coeff: the spherical harmonics coefficients of size (N, 16, 3) ~ features_rest
         '''
         
         xyz, rotations, features = self.gaussians.external_rotation(3, rotation_angle, 'x')
@@ -619,37 +600,129 @@ class SHsplitMLP(nn.Module):
         xyz3 = xyz[self.group3_mask]
         xyz4 = xyz[self.group4_mask]
 
-        rotation_angle = self.rotation_dense(rotation_angle)
+        rotation_angle = self.rotation_dense(rotation_angle.double())
+
+        sh_group1 = self.sh_dense1(self.sh_group1.view(self.N_1 * 16 * 3, -1))
+        sh_group2 = self.sh_dense2(self.sh_group2.view(self.N_2 * 16 * 3, -1))
+        sh_group3 = self.sh_dense3(self.sh_group3.view(self.N_3 * 16 * 3, -1))
+        sh_group4 = self.sh_dense4(self.sh_group4.view(self.N_4 * 16 * 3, -1))
+
+        xyz1 = self.xyz_dense1(xyz1.view(self.N_1 * 3, -1))
+        xyz2 = self.xyz_dense2(xyz2.view(self.N_2 * 3, -1))
+        xyz3 = self.xyz_dense3(xyz3.view(self.N_3 * 3, -1))
+        xyz4 = self.xyz_dense4(xyz4.view(self.N_4 * 3, -1))
+
+        concat1 = torch.cat((rotation_angle, sh_group1, xyz1, xyz2, xyz3, xyz4), dim=1)
+        concat2 = torch.cat((rotation_angle, sh_group2, xyz1, xyz2, xyz3, xyz4), dim=1)
+        concat3 = torch.cat((rotation_angle, sh_group3, xyz1, xyz2, xyz3, xyz4), dim=1)
+        concat4 = torch.cat((rotation_angle, sh_group4, xyz1, xyz2, xyz3, xyz4), dim=1)
+
+        output1 = self.output_dense1(concat1)
+        output2 = self.output_dense2(concat2)
+        output3 = self.output_dense3(concat3)
+        output4 = self.output_dense4(concat4)
+
+        output = torch.zeros(self.N, 16, 3, device="cuda")
+        output[self.group1_mask] = output1
+        output[self.group2_mask] = output2
+        output[self.group3_mask] = output3
+        output[self.group4_mask] = output4
+
+        # find the viewpoint_cam in the viewpoint_stack where the image_name matches
+        image_name = os.path.basename(image_name)
+        viewpoint_cam = [viewpoint for viewpoint in self.viewpoint_stack if viewpoint.image_name == image_name][0]
+        rendered_image = self.renderer(output, viewpoint_cam, rotation_angle)
         
-        sh_group1 = self.sh_dense1_gr1(self.sh_group1)
-        sh_group2 = self.sh_dense1_gr2(self.sh_group2)
-        sh_group3 = self.sh_dense1_gr3(self.sh_group3)
-        sh_group4 = self.sh_dense1_gr4(self.sh_group4)
+        return rendered_image
 
-        xyz_group1 = self.xyz_dense1_gr1(xyz1)
-        xyz_group2 = self.xyz_dense1_gr2(xyz2)
-        xyz_group3 = self.xyz_dense1_gr3(xyz3)
-        xyz_group4 = self.xyz_dense1_gr4(xyz4)
+class SubGroupMLP(nn.Module):
+    def __init__(self, N, viewpoint_stack, pipe, bg, chkpt, sh_degree, opt, sh_coeff, groups):
+        super(SubGroupMLP, self).__init__()
+        '''
+        Same MLP as SHMLP but with the sh_coeff split into 11 tensors of size (N_i, 16, 3)
+        where the N_i represent the number of gaussians contained in each group.
+        The model splits up the data spatially using precomputed groups thanks to the 
+        bounding boxes of the gaussians. We will then treat each group independently and
+        combine the results in order for each part to have access to the information
+        contained in the other parts.
+        '''
+        torch.set_default_dtype(d=torch.double)
+        self.N = N
+        self.pipe = pipe
+        self.bg = bg
+        self.viewpoint_stack = viewpoint_stack
+        self.groups = groups.detach().cpu()
+        self.gaussians = GaussianModel(sh_degree)
+        if chkpt:
+            (model_params, first_iter) = torch.load(chkpt)
+            self.gaussians.restore(model_params, opt)
 
-        concat_sh_xyz_gr12 = self.sh_xyz_dense_gr12(torch.cat((rotation_angle, sh_group1, xyz_group2), dim=1))
-        concat_sh_xyz_gr13 = self.sh_xyz_dense_gr13(torch.cat((rotation_angle, sh_group1, xyz_group3), dim=1))
-        concat_sh_xyz_gr14 = self.sh_xyz_dense_gr14(torch.cat((rotation_angle, sh_group1, xyz_group4), dim=1))
-        concat_sh_xyz_gr21 = self.sh_xyz_dense_gr21(torch.cat((rotation_angle, sh_group2, xyz_group1), dim=1))
-        concat_sh_xyz_gr23 = self.sh_xyz_dense_gr23(torch.cat((rotation_angle, sh_group2, xyz_group3), dim=1))
-        concat_sh_xyz_gr24 = self.sh_xyz_dense_gr24(torch.cat((rotation_angle, sh_group2, xyz_group4), dim=1))
-        concat_sh_xyz_gr31 = self.sh_xyz_dense_gr31(torch.cat((rotation_angle, sh_group3, xyz_group1), dim=1))
-        concat_sh_xyz_gr32 = self.sh_xyz_dense_gr32(torch.cat((rotation_angle, sh_group3, xyz_group2), dim=1))
-        concat_sh_xyz_gr34 = self.sh_xyz_dense_gr34(torch.cat((rotation_angle, sh_group3, xyz_group4), dim=1))
-        concat_sh_xyz_gr41 = self.sh_xyz_dense_gr41(torch.cat((rotation_angle, sh_group4, xyz_group1), dim=1))
-        concat_sh_xyz_gr42 = self.sh_xyz_dense_gr42(torch.cat((rotation_angle, sh_group4, xyz_group2), dim=1))
-        concat_sh_xyz_gr43 = self.sh_xyz_dense_gr43(torch.cat((rotation_angle, sh_group4, xyz_group3), dim=1))
-                                                    
-        output_gr1 = self.output_gr1(torch.cat((concat_sh_xyz_gr12, concat_sh_xyz_gr13, concat_sh_xyz_gr14), dim=1))
-        output_gr2 = self.output_gr2(torch.cat((concat_sh_xyz_gr21, concat_sh_xyz_gr23, concat_sh_xyz_gr24), dim=1))
-        output_gr3 = self.output_gr3(torch.cat((concat_sh_xyz_gr31, concat_sh_xyz_gr32, concat_sh_xyz_gr34), dim=1))
-        output_gr4 = self.output_gr4(torch.cat((concat_sh_xyz_gr41, concat_sh_xyz_gr42, concat_sh_xyz_gr43), dim=1))
+        print(f'The groups are {groups.cpu().numpy()}')
 
-        output = torch.cat((output_gr1, output_gr2, output_gr3, output_gr4), dim=0)
+        print(f'The minimum group index is {torch.min(groups)} and the maximum group index is {torch.max(groups)}')
+        self.xyz = self.gaussians.get_xyz.detach().cpu()
+        self.rotations = self.gaussians.get_rots.detach().cpu()
+        self.features_rest = self.gaussians.get_features_rest.detach().cpu()
+
+        # USING FULLY CONNECTED DENSE LAYERS IN A SPLITTED MANNER
+
+        self.sh_coeff = sh_coeff.view(self.N, 16, 3).detach().cpu()
+
+        self.group_masks = [self.groups == i for i in range(1, 12)]
+
+        for i, mask in enumerate(self.group_masks):
+            print(f'Mask for group {i+1} : {mask}')
+
+        self.group_sizes = [mask.sum() for mask in self.group_masks]
+
+        for i, size in enumerate(self.group_sizes):
+            print(f'Group {i+1} contains {size} gaussians')
+
+        self.sh_groups = [self.sh_coeff[mask].double() for mask in self.group_masks]
+        self.xyz_groups = [self.xyz[mask].double() for mask in self.group_masks]
+
+        A = 128
+        B = 128
+
+        self.rotation_dense = nn.Linear(1, 32, dtype=torch.double)
+
+        self.sh_denses = nn.ModuleList([nn.Linear(size * 16 * 3, A, dtype=torch.double) for size in self.group_sizes])
+        self.xyz_denses = nn.ModuleList([nn.Linear(size * 3, B, dtype=torch.double) for size in self.group_sizes])
+        
+        self.output_denses = nn.ModuleList([nn.Linear(A + 11 * B + 32, size * 16 * 3, dtype=torch.double) for size in self.group_sizes])
+
+        self.renderer = DifferentiableRenderer(chkpt, sh_degree, pipe, bg, opt)
+        print('SHsplitMLP Model initialized')
+        print(self)
+        print(f"Model size on GPU : {torch.cuda.memory_allocated(device=torch.device('cuda'))/1_000_000_000} Go")
+        print(f"Maximum memory allocated on GPU: {torch.cuda.max_memory_allocated(device=torch.device('cuda'))/1_000_000_000} Go")
+    
+    
+    def forward(self, rotation_angle, image_name):
+        '''
+        Input:
+            - rotation_angle: the angle of rotation of the viewpoint (in radians)
+            - sh_coeff: the spherical harmonics coefficients of size (N, 16, 3) ~ features_dc + features_rest
+        '''
+        
+        xyz, rotations, features = self.gaussians.external_rotation(3, rotation_angle, 'x')
+
+        xyz_groups = [xyz[mask].double() for mask in self.group_masks]
+
+        rotation_angle = self.rotation_dense(rotation_angle.double())
+
+        sh_groups = [dense(sh_group.double().view(size * 16 * 3, -1).double()) for dense, sh_group, size in zip(self.sh_denses, self.sh_groups, self.group_sizes)]
+        xyz_groups_dense = [dense(xyz_group.double().view(size * 3, -1).double()) for dense, xyz_group, size in zip(self.xyz_denses, xyz_groups, self.group_sizes)]
+
+        outputs = []
+        for i in range(11):
+            concat = torch.cat((rotation_angle, xyz_groups_dense[:i], [sh_groups[i]], xyz_groups_dense[i+1:]), dim=1)
+            output = self.output_denses[i](concat)
+            outputs.append(output)
+
+        output = torch.zeros(self.N, 16, 3, device="cuda")
+        for i, mask in enumerate(self.group_masks):
+            output[mask] = outputs[i]
 
         # find the viewpoint_cam in the viewpoint_stack where the image_name matches
         image_name = os.path.basename(image_name)
@@ -793,5 +866,7 @@ if __name__ == "__main__":
     dataset, gaussians, scene, pipe, background = training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.json_bounds, args.sh_fitting)
     # All done
     print("\nTraining complete.")
-
+    
+    # Clean / Supress everything that is still on the GPU
+    torch.cuda.empty_cache()
     shs_fit(args, dataset, gaussians, scene, pipe, background)
