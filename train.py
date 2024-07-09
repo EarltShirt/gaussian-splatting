@@ -39,6 +39,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torchvision.io import read_image
 from sklearn.decomposition import PCA
+from memory_profiler import profile
 
 
 def load_bounds(file_path):
@@ -215,6 +216,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     torch.save((gaussians.capture(), iteration), scene.model_path + "/final_chkpnt.pth") 
     return dataset, gaussians, scene, pipe, background
 
+@profile
 def shs_fit(args, dataset, gaussians, scene, pipe, background):
     if args.sh_fitting is None:
         chkpt_path = scene.model_path + "/final_chkpnt.pth"
@@ -224,16 +226,16 @@ def shs_fit(args, dataset, gaussians, scene, pipe, background):
     folders_path = os.path.abspath(os.path.join(dataset.source_path, '..'))
     # folders_path = os.path(dataset.source_path).parent
 
-    print(f'Loading the angles from the dataset at {folders_path}')
-    
+    print(f'Loading the dataset from {folders_path}')    
     train_data, test_data, val_data, angles = retrieve_data(folders_path)
 
+    print(f'Creating the dataset')
     TrainSet = SHDataset(train_data, gaussians, folders_path)
     TestSet = SHDataset(test_data, gaussians, folders_path)
     ValSet = SHDataset(val_data, gaussians, folders_path)
     
     print(f'The Fitting Process May Commence')
-    print(f'\nThe retrieved groups are {gaussians.get_groups().cpu().numpy()}')
+    print(f'Creating the model')
     model = SubGroupMLP( gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, 
                         background, chkpt_path, gaussians.max_sh_degree, op.extract(args), 
                         gaussians.get_features, gaussians.get_subgroups() )
@@ -248,6 +250,7 @@ def shs_fit(args, dataset, gaussians, scene, pipe, background):
     size_all_mb = (param_size + buffer_size) / 1024**2
     print('model size: {:.3f}MB'.format(size_all_mb))
     
+    print(f'Training the model')
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     TrainLoader = DataLoader(TrainSet, batch_size=1, shuffle=True)
     train_model(model, TrainLoader, optimizer)
@@ -481,7 +484,7 @@ class SHMLP(nn.Module):
         print('SHMLP Model initialized')
         print(self)
         print(f'Model size : {torch.cuda.memory_allocated()/1_000_000_000} Go')
-
+    
     def forward(self, rotation_angle, image_name):
         '''
         Input:
@@ -635,18 +638,12 @@ class SHsplitMLP(nn.Module):
         
         return rendered_image
 
+
 class SubGroupMLP(nn.Module):
+    @profile
     def __init__(self, N, viewpoint_stack, pipe, bg, chkpt, sh_degree, opt, sh_coeff, groups):
         super(SubGroupMLP, self).__init__()
-        '''
-        Same MLP as SHMLP but with the sh_coeff split into 11 tensors of size (N_i, 16, 3)
-        where the N_i represent the number of gaussians contained in each group.
-        The model splits up the data spatially using precomputed groups thanks to the 
-        bounding boxes of the gaussians. We will then treat each group independently and
-        combine the results in order for each part to have access to the information
-        contained in the other parts.
-        '''
-        torch.set_default_dtype(d=torch.double)
+        torch.set_default_dtype(torch.double)
         self.N = N
         self.pipe = pipe
         self.bg = bg
@@ -658,25 +655,15 @@ class SubGroupMLP(nn.Module):
             self.gaussians.restore(model_params, opt)
 
         print(f'The groups are {groups.cpu().numpy()}')
-
         print(f'The minimum group index is {torch.min(groups)} and the maximum group index is {torch.max(groups)}')
+
         self.xyz = self.gaussians.get_xyz.detach().cpu()
         self.rotations = self.gaussians.get_rots.detach().cpu()
         self.features_rest = self.gaussians.get_features_rest.detach().cpu()
 
-        # USING FULLY CONNECTED DENSE LAYERS IN A SPLITTED MANNER
-
         self.sh_coeff = sh_coeff.view(self.N, 16, 3).detach().cpu()
-
         self.group_masks = [self.groups == i for i in range(1, 12)]
-
-        for i, mask in enumerate(self.group_masks):
-            print(f'Mask for group {i+1} : {mask}')
-
         self.group_sizes = [mask.sum() for mask in self.group_masks]
-
-        for i, size in enumerate(self.group_sizes):
-            print(f'Group {i+1} contains {size} gaussians')
 
         self.sh_groups = [self.sh_coeff[mask].double() for mask in self.group_masks]
         self.xyz_groups = [self.xyz[mask].double() for mask in self.group_masks]
@@ -684,52 +671,70 @@ class SubGroupMLP(nn.Module):
         A = 128
         B = 128
 
+        print(f'Creating the rotation dense layer')
         self.rotation_dense = nn.Linear(1, 32, dtype=torch.double)
 
+        print(f'Creating the sh dense layers')
         self.sh_denses = nn.ModuleList([nn.Linear(size * 16 * 3, A, dtype=torch.double) for size in self.group_sizes])
+        print(f'Creating the xyz dense layers')
         self.xyz_denses = nn.ModuleList([nn.Linear(size * 3, B, dtype=torch.double) for size in self.group_sizes])
-        
+        print(f'Creating the output dense layers')
         self.output_denses = nn.ModuleList([nn.Linear(A + 11 * B + 32, size * 16 * 3, dtype=torch.double) for size in self.group_sizes])
-
+        print(f'Creating the DifferentiableRenderer')
         self.renderer = DifferentiableRenderer(chkpt, sh_degree, pipe, bg, opt)
-        print('SHsplitMLP Model initialized')
+        print('SubGroupMLP Model initialized')
         print(self)
-        print(f"Model size on GPU : {torch.cuda.memory_allocated(device=torch.device('cuda'))/1_000_000_000} Go")
-        print(f"Maximum memory allocated on GPU: {torch.cuda.max_memory_allocated(device=torch.device('cuda'))/1_000_000_000} Go")
+        print(f"Model size on GPU : {torch.cuda.memory_allocated(device=torch.device('cuda')) / 1_000_000_000} Go")
+        print(f"Maximum memory allocated on GPU: {torch.cuda.max_memory_allocated(device=torch.device('cuda')) / 1_000_000_000} Go")
     
-    
+    @profile
     def forward(self, rotation_angle, image_name):
-        '''
-        Input:
-            - rotation_angle: the angle of rotation of the viewpoint (in radians)
-            - sh_coeff: the spherical harmonics coefficients of size (N, 16, 3) ~ features_dc + features_rest
-        '''
-        
         xyz, rotations, features = self.gaussians.external_rotation(3, rotation_angle, 'x')
-
         xyz_groups = [xyz[mask].double() for mask in self.group_masks]
 
         rotation_angle = self.rotation_dense(rotation_angle.double())
 
-        sh_groups = [dense(sh_group.double().view(size * 16 * 3, -1).double()) for dense, sh_group, size in zip(self.sh_denses, self.sh_groups, self.group_sizes)]
-        xyz_groups_dense = [dense(xyz_group.double().view(size * 3, -1).double()) for dense, xyz_group, size in zip(self.xyz_denses, xyz_groups, self.group_sizes)]
+        sh_groups = []
+        for dense, sh_group, size in zip(self.sh_denses, self.sh_groups, self.group_sizes):
+            dense = dense.to('cuda')
+            sh_group_gpu = sh_group.view(size * 16 * 3, -1).double().to('cuda')
+            sh_groups.append(dense(torch.transpose(sh_group_gpu,dim0=0,dim1=1)).to('cpu'))
+            dense = dense.to('cpu')
+            del sh_group_gpu
+            torch.cuda.empty_cache()
+
+        xyz_groups_dense = []
+        for dense, xyz_group, size in zip(self.xyz_denses, xyz_groups, self.group_sizes):
+            dense = dense.to('cuda')
+            xyz_group_gpu = xyz_group.view(size * 3, -1).double().to('cuda')
+            xyz_groups_dense.append(dense(torch.transpose(xyz_group_gpu,dim0=0,dim1=1)).to('cpu'))
+            dense = dense.to('cpu')
+            del xyz_group_gpu
+            torch.cuda.empty_cache()
 
         outputs = []
         for i in range(11):
-            concat = torch.cat((rotation_angle, xyz_groups_dense[:i], [sh_groups[i]], xyz_groups_dense[i+1:]), dim=1)
-            output = self.output_denses[i](concat)
-            outputs.append(output)
+            concat = torch.cat((rotation_angle, *xyz_groups_dense[:i], sh_groups[i], *xyz_groups_dense[i+1:]), dim=0)
+            dense = self.output_denses[i].to('cuda')
+            output_gpu = dense(concat.to('cuda'))
+            outputs.append(output_gpu.to('cpu'))
+            dense = dense.to('cpu')
+            del concat, output_gpu
+            torch.cuda.empty_cache()
 
-        output = torch.zeros(self.N, 16, 3, device="cuda")
+        output = torch.zeros(self.N, 16, 3, device="cpu")
         for i, mask in enumerate(self.group_masks):
             output[mask] = outputs[i]
 
-        # find the viewpoint_cam in the viewpoint_stack where the image_name matches
+        output = output.to('cuda')
+        
+        # Find the viewpoint_cam in the viewpoint_stack where the image_name matches
         image_name = os.path.basename(image_name)
         viewpoint_cam = [viewpoint for viewpoint in self.viewpoint_stack if viewpoint.image_name == image_name][0]
         rendered_image = self.renderer(output, viewpoint_cam, rotation_angle)
         
         return rendered_image
+
 
 class SHConv(nn.Module):
     def __init__(self, N, viewpoint_stack, pipe, bg, chkpt, sh_degree, opt, sh_coeff):
