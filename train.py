@@ -217,7 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     return dataset, gaussians, scene, pipe, background
 
 @profile
-def shs_fit(args, dataset, gaussians, scene, pipe, background):
+def shs_fit(args, dataset, gaussians, scene, pipe, background, model):
     if args.sh_fitting is None:
         chkpt_path = scene.model_path + "/final_chkpnt.pth"
     else:
@@ -236,9 +236,27 @@ def shs_fit(args, dataset, gaussians, scene, pipe, background):
     
     print(f'The Fitting Process May Commence')
     print(f'Creating the model')
-    model = SubGroupMLP( gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, 
-                        background, chkpt_path, gaussians.max_sh_degree, op.extract(args), 
-                        gaussians.get_features, gaussians.get_subgroups() )
+    model_type = args.model_type
+
+    if model_type == 0:
+        model = SubGroupMLP(gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, 
+                            background, chkpt_path, gaussians.max_sh_degree, op.extract(args), 
+                            gaussians.get_features, gaussians.get_subgroups())
+    elif model_type == 1:
+        model = SHConv(gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, 
+                          background, chkpt_path, gaussians.max_sh_degree, op.extract(args), 
+                          gaussians.get_features)
+    elif model_type == 2:
+        model = SHMLP(gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe, 
+                          background, chkpt_path, gaussians.max_sh_degree, op.extract(args), 
+                          gaussians.get_features)
+    elif model_type == 3:
+        model = SHsplitMLP(gaussians.get_xyz.shape[0], scene.getTrainCameras().copy(), pipe,
+                            background, chkpt_path, gaussians.max_sh_degree, op.extract(args),
+                            gaussians.get_features, gaussians.get_groups())
+    else:
+        raise ValueError("Invalid model type")
+
 
     param_size = 0
     for param in model.parameters():
@@ -739,43 +757,71 @@ class SubGroupMLP(nn.Module):
 class SHConv(nn.Module):
     def __init__(self, N, viewpoint_stack, pipe, bg, chkpt, sh_degree, opt, sh_coeff):
         super(SHConv, self).__init__()
-        '''
-        
-        if convolutional layers are used, we will keep the original dimensions of the spherical
-        harmonics (N, 15, 3). We will optimize the process by spatially reordering the gaussians,
-        and therefore the xyz, features and rotations tensors depending on the gaussians' positions in space
-        '''
+        torch.set_default_dtype(torch.double)
         self.N = N
         self.pipe = pipe
         self.bg = bg
-        self.vewpoint_stack = viewpoint_stack
+        self.viewpoint_stack = viewpoint_stack
+        self.gaussians = GaussianModel(sh_degree)
+        if chkpt:
+            (model_params, first_iter) = torch.load(chkpt)
+            self.gaussians.restore(model_params, opt)
 
-        self.sh_coeff = sh_coeff.view(self.N, 15, 3)
-        
-        # USING CONVOLUTIONAL LAYERS
+        self.sh_coeff = sh_coeff.view(self.N, 16, 3).detach().cpu()
+        self.xyz = self.gaussians.get_xyz.detach().cpu()
+        self.rotations = self.gaussians.get_rots.detach().cpu()
+        self.features_rest = self.gaussians.get_features_rest.detach().cpu()
 
-        self.sh_coeff = sh_coeff.view(self.N, 15, 3)
-
-        self.input_dim_sh = (self.N, 15, 3)
+        self.input_dim_sh = (self.N, 16, 3)
         self.input_dim_xyz = (self.N, 3)
         self.input_dim_angle = 1
 
-        self.rotation_conv = nn.Conv1d(1, 32, 1) # (1) -> (32)
+        # Convolutional layers
+        self.rotation_conv = nn.Conv1d(1, 32, 1)
+
+        self.sh_conv1 = nn.Conv1d(16 * 3, 128, 1)
+        self.sh_conv2 = nn.Conv1d(128, 128, 1)
+
+        self.xyz_conv1 = nn.Conv1d(3, 128, 1)
+        self.xyz_conv2 = nn.Conv1d(128, 128, 1)
+
+        self.output_conv1 = nn.Conv1d(128 + 11 * 128 + 32, 128, 1)
+        self.output_conv2 = nn.Conv1d(128, 16 * 3, 1)
+
+        self.renderer = DifferentiableRenderer(chkpt, sh_degree, pipe, bg, opt)
 
         print('SHConv Model initialized')
         print(self)
-        print(f'Model size : {torch.cuda.memory_allocated()/1_000_000_000} Go')
+        print(f'Model size : {torch.cuda.memory_allocated() / 1_000_000_000} Go')
 
     def forward(self, rotation_angle, image_name):
         '''
         Input:
             - rotation_angle: the angle of rotation of the viewpoint (in radians)
-            - sh_coeff: the spherical harmonics coefficients of size (N, 15, 3) ~ features_rest
+            - sh_coeff: the spherical harmonics coefficients of size (N, 16, 3) ~ features_rest
         '''
+        xyz, rotations, features = self.gaussians.external_rotation(3, rotation_angle, 'x')
+
+        rotation_angle = rotation_angle.view(1, 1, -1).double()
+        rotation_angle = self.rotation_conv(rotation_angle).squeeze()
+
+        sh_coeff = self.sh_coeff.permute(0, 2, 1).reshape(self.N, -1).unsqueeze(2).double()
+        sh_output = self.sh_conv1(sh_coeff)
+        sh_output = self.sh_conv2(sh_output).squeeze()
+
+        xyz = xyz.permute(0, 2, 1).reshape(self.N, -1).unsqueeze(2).double()
+        xyz_output = self.xyz_conv1(xyz)
+        xyz_output = self.xyz_conv2(xyz_output).squeeze()
+
+        concat = torch.cat((rotation_angle, xyz_output, sh_output), dim=1).unsqueeze(2)
+        output = self.output_conv1(concat)
+        output = self.output_conv2(output).view(self.N, 16, 3)
+
+        # Find the viewpoint_cam in the viewpoint_stack where the image_name matches
         image_name = os.path.basename(image_name)
         viewpoint_cam = [viewpoint for viewpoint in self.viewpoint_stack if viewpoint.image_name == image_name][0]
         rendered_image = self.renderer(output, viewpoint_cam, rotation_angle)
-        
+
         return rendered_image
 #################################################################################################
 #################################################################################################
@@ -856,6 +902,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--json_bounds", type=str, default = None)
     parser.add_argument("--sh_fitting", type=str, default = None)
+    parser.add_argument("--model", type=int, default = 0)
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -874,4 +921,4 @@ if __name__ == "__main__":
     
     # Clean / Supress everything that is still on the GPU
     torch.cuda.empty_cache()
-    shs_fit(args, dataset, gaussians, scene, pipe, background)
+    shs_fit(args, dataset, gaussians, scene, pipe, background, args.model)
